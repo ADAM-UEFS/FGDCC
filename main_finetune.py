@@ -34,9 +34,9 @@ from util.datasets import build_dataset
 from util.pos_embed import interpolate_pos_embed
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
-import models_vit
+from src.models import models_vit, DeeperCluster_v2
 
-from engine_finetune import train_one_epoch, evaluate
+from src.engine_finetune import train_one_epoch, evaluate
 
 
 def get_args_parser():
@@ -230,6 +230,7 @@ def main(args):
         global_pool=args.global_pool,
     )
 
+    # TODO: Move this somewhere else
     if args.finetune and not args.eval:
         checkpoint = torch.load(args.finetune, map_location='cpu')
 
@@ -255,6 +256,9 @@ def main(args):
 
         # manually initialize fc layer
         trunc_normal_(model.head.weight, std=2e-5)
+
+
+    # clustering_model = DeeperCluster_v2(vit_encoder=model)
 
     model.to(device)
 

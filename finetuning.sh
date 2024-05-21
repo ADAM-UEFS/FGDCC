@@ -3,10 +3,10 @@
 #touch run/experiment.log
 
 export IMAGENET_DIR='/home/rtcalumby/adam/luciano/LifeCLEFPlant2022/'
-export PRETRAIN_CHKPT='mae_pretrain_vit_large.pth'
+export PRETRAIN_CHKPT='../pretrained/mae_pretrain_vit_large.pth'
 export name="IN1k_Clef2022"
 export all_epoch=100
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 #OMP_NUM_THREADS=1 python3 -m torch.distributed.run --nproc_per_node=6 main_finetune.py \
 #    --accum_iter 2 \
@@ -24,7 +24,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
 #    --output_dir checkpoint/${name} \
 #    --num_workers 20  # default: 20
 
-OMP_NUM_THREADS=1 python3 -m torch.distributed.launch --nproc_per_node=6 main_finetune.py \
+OMP_NUM_THREADS=1 python3 -m torch.distributed.run --nproc_per_node=8 main_finetune.py \
     --accum_iter 4 \
     --batch_size 128 \
     --model vit_large_patch16  \
@@ -36,6 +36,6 @@ OMP_NUM_THREADS=1 python3 -m torch.distributed.launch --nproc_per_node=6 main_fi
     --log_dir "checkpoint/${name}/log" \
     --nb_classes 80000 \
     --output_dir "checkpoint/${name}" \
-    --num_workers 20  # default: 20 
+    --num_workers 64  # default: 20 
 
 
