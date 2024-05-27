@@ -19,7 +19,7 @@ import torch.nn  as nn
 import torch.nn.functional as F
 from torch import inf 
 
-import models.autoencoder as AE
+import src.models.autoencoder as AE
 
 # from timm.models.layers import trunc_normal_ 
 import util.lr_decay as lrd
@@ -178,6 +178,15 @@ class FinetuningModel(nn.Module):
         return x
 
 
+    def forward_features(self, x):
+        x = self.pretrained_model(x)
+
+        x = torch.mean(x, dim=1)
+        
+        x = F.layer_norm(x, (x.size(-1),))  # normalize over feature-dim 
+
+        return x 
+
     def forward(self, x):
 
         x = self.pretrained_model(x)
@@ -266,7 +275,6 @@ def init_model(
         num_heads=encoder.num_heads)
 
     autoencoder = AE.vanilla_autoencoder()
-
 
     def init_weights(m):
         if isinstance(m, torch.nn.Linear):

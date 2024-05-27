@@ -40,6 +40,7 @@ from src.utils.logging import (
     gpu_timer,
     grad_logger,
     AverageMeter)
+
 from src.utils.tensors import repeat_interleave_batch
 from src.datasets.imagenet1k import make_imagenet1k
 from src.datasets.PlantCLEF2022 import make_PlantCLEF2022
@@ -59,6 +60,9 @@ import time
 from timm.data.mixup import Mixup
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.utils import accuracy
+
+import faiss
+import faiss.contrib.torch_utils
 
 # --
 log_timings = True
@@ -300,6 +304,7 @@ def main(args, resume_preempt=False):
     encoder = DistributedDataParallel(encoder, static_graph=True)
     predictor = DistributedDataParallel(predictor, static_graph=True)
     target_encoder = DistributedDataParallel(target_encoder, static_graph=True)
+    autoencoder = DistributedDataParallel(autoencoder, static_graph=True)
 
     # -- Load ImageNet weights
     if resume_epoch == 0:    
@@ -370,6 +375,8 @@ def main(args, resume_preempt=False):
     accum_iter = 4
     start_epoch = resume_epoch
 
+
+
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
         
@@ -412,7 +419,11 @@ def main(args, resume_preempt=False):
                             
                 # Step 1. Forward
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
-                    h = target_encoder(imgs)
+                    #h = target_encoder(imgs)
+                    h = target_encoder.forward_features(imgs)
+                    reconstructed_input, bottleneck_output = autoencoder(h)
+                    AE_loss = F.smooth_l1_loss(reconstructed_input, h)
+
                     loss = loss_fn(h, targets)
 
                 loss_value = loss.item()
