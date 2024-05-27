@@ -87,7 +87,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 model = VanillaAE()
 model = model.to(device)
 
-loss_function = torch.nn.CrossEntropyLoss()
+loss_function = torch.nn.CrossEntropyLoss() # FIXME: error here, if using crossentropy we shouldn't use activations such as sigmoid 
 optimizer = torch.optim.Adam(model.parameters(), lr=1.5e-1, weight_decay = 1e-8)
 
 epochs = 50

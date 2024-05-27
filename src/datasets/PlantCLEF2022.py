@@ -23,7 +23,7 @@ from timm.data import create_transform
 
 def build_dataset(is_train, args=None):
     transform = build_transform(is_train, args)
-    image_folder='/home/rtcalumby/adam/luciano/iNaturalist2019/'
+    image_folder='/home/rtcalumby/adam/luciano/PlantNet300k/plantnet_300K'
     root = os.path.join(image_folder, 'train' if is_train else 'val')
     dataset = datasets.ImageFolder(root, transform=transform)
 

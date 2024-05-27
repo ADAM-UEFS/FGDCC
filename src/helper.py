@@ -19,6 +19,8 @@ import torch.nn  as nn
 import torch.nn.functional as F
 from torch import inf 
 
+import models.autoencoder as AE
+
 # from timm.models.layers import trunc_normal_ 
 import util.lr_decay as lrd
 
@@ -126,11 +128,6 @@ class FinetuningModel(nn.Module):
 
         self.mlp_head = nn.Linear(self.pretrained_model.embed_dim,
                                   self.nb_classes)
-        #nn.Sequential(
-        #    nn.LayerNorm(self.pretrained_model.embed_dim), # TODO: normalize over a different dim[]
-        #    nn.Dropout(drop_path),
-        #    nn.Linear(self.pretrained_model.embed_dim,
-        #                                self.nb_classes))   
 
     '''
         " Because our I-JEPA implementation uses Vision Transformer architectures without a [cls] token, 
@@ -185,11 +182,8 @@ class FinetuningModel(nn.Module):
 
         x = self.pretrained_model(x)
 
-        #x = self.average_pool(x.transpose(1, 2)).transpose(1, 2) # todo review
         x = torch.mean(x, dim=1) # alternative
         
-        #x = x.squeeze(-1)
-
         x = F.layer_norm(x, (x.size(-1),))  # normalize over feature-dim 
         
         x = self.head_drop(x) # As in in timm.models
@@ -271,6 +265,9 @@ def init_model(
         depth=pred_depth,
         num_heads=encoder.num_heads)
 
+    autoencoder = AE.vanilla_autoencoder()
+
+
     def init_weights(m):
         if isinstance(m, torch.nn.Linear):
             trunc_normal_(m.weight, std=0.02)
@@ -280,16 +277,22 @@ def init_model(
             torch.nn.init.constant_(m.bias, 0)
             torch.nn.init.constant_(m.weight, 1.0)
 
+    for m in autoencoder.modules():
+        init_weights(m)
+
     for m in encoder.modules():
         init_weights(m)
 
     for m in predictor.modules():
         init_weights(m)
 
+
+    autoencoder.to(device)
     encoder.to(device)
     predictor.to(device)
-    # logger.info(encoder)
-    return encoder, predictor
+    
+    #logger.info(autoencoder)
+    return encoder, predictor, autoencoder
 
 def init_opt(
     encoder,

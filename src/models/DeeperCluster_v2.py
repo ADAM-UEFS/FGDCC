@@ -32,7 +32,6 @@ class DeeperClusterV2(nn.Module):
         inp = self.vit_encoder.forward_features(x)
         reconstructed_input, bottleneck_output = self.autoencoder(inp)
         
-# TODO: Replace leaky with gelus.
 class AutoEncoder(nn.Module):
     def __init__(self):
         super().__init__()

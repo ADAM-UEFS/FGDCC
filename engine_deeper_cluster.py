@@ -190,7 +190,7 @@ def main(args, resume_preempt=False):
                            ('%d', 'time (ms)'))
     
     # -- init model
-    encoder, predictor, _ = init_model(
+    encoder, predictor, autoencoder = init_model(
         device=device,
         patch_size=patch_size,
         crop_size=crop_size,
@@ -198,6 +198,8 @@ def main(args, resume_preempt=False):
         pred_emb_dim=pred_emb_dim,
         model_name=model_name)
     target_encoder = copy.deepcopy(encoder)
+
+    logger.info(autoencoder)
 
     training_transform = make_transforms( 
         crop_size=crop_size,
@@ -259,6 +261,8 @@ def main(args, resume_preempt=False):
     
     ipe_val = len(supervised_loader_val)
 
+    # The val dataset has length of 546048, which alongside with a batch_size of 96 * 4 gpus = 1422 batches per gpu so distributed testing
+    # under these circumstances should be fine. 
     print('Val dataset, length:', ipe_val*batch_size)
 
 
@@ -370,8 +374,11 @@ def main(args, resume_preempt=False):
     for epoch in range(start_epoch, num_epochs):
         
         logger.info('Epoch %d' % (epoch + 1))
-        
-        supervised_sampler_train.set_epoch(epoch) # -- In distributed mode, calling the set_epoch() method at the beginning of each epoch before creating the DataLoader iterator is necessary to make shuffling work properly across multiple epochs. Otherwise, the same ordering will be always used.        
+        # In distributed mode, calling the set_epoch() method 
+        # at the beginning of each epoch before creating the DataLoader iterator
+        # is necessary to make shuffling work properly across multiple epochs.
+        # Otherwise, the same ordering will be always used.        
+        supervised_sampler_train.set_epoch(epoch) # -- update distributed-data-loader epoch
         
         loss_meter = AverageMeter()
         time_meter = AverageMeter()
@@ -491,7 +498,7 @@ def main(args, resume_preempt=False):
         logger.info('avg. test_loss %.3f avg. Accuracy@1 %.3f - avg. Accuracy@5 %.3f' % (test_loss.avg, testAcc1.avg, testAcc5.avg))
         save_checkpoint(epoch+1)
         assert not np.isnan(loss), 'loss is nan'
-        logger.info('Loss %.5f' % loss)
+        logger.info('Loss %.4f' % loss)
 
 if __name__ == "__main__":
     main()
