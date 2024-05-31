@@ -363,7 +363,7 @@ def main(args, resume_preempt=False):
     del encoder
     del predictor
     
-    accum_iter = 4
+    accum_iter = 1
     start_epoch = resume_epoch
 
     # -- TRAINING LOOP

@@ -61,8 +61,6 @@ from timm.data.mixup import Mixup
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.utils import accuracy
 
-import faiss
-import faiss.contrib.torch_utils
 
 # --
 log_timings = True
@@ -265,10 +263,7 @@ def main(args, resume_preempt=False):
     
     ipe_val = len(supervised_loader_val)
 
-    # The val dataset has length of 546048, which alongside with a batch_size of 96 * 4 gpus = 1422 batches per gpu so distributed testing
-    # under these circumstances should be fine. 
     print('Val dataset, length:', ipe_val*batch_size)
-
 
     # -- init optimizer and scheduler
     optimizer, scaler, scheduler, wd_scheduler = init_opt(
@@ -305,6 +300,7 @@ def main(args, resume_preempt=False):
     predictor = DistributedDataParallel(predictor, static_graph=True)
     target_encoder = DistributedDataParallel(target_encoder, static_graph=True)
     autoencoder = DistributedDataParallel(autoencoder, static_graph=True)
+
 
     # -- Load ImageNet weights
     if resume_epoch == 0:    
@@ -372,20 +368,16 @@ def main(args, resume_preempt=False):
     del encoder
     del predictor
     
-    accum_iter = 4
+    accum_iter = 1
     start_epoch = resume_epoch
-
-
 
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
         
         logger.info('Epoch %d' % (epoch + 1))
-        # In distributed mode, calling the set_epoch() method 
-        # at the beginning of each epoch before creating the DataLoader iterator
-        # is necessary to make shuffling work properly across multiple epochs.
+        # In distributed mode, calling the set_epoch() method at the beginning of each epoch before creating the DataLoader iterator is necessary to make shuffling work properly across multiple epochs.
         # Otherwise, the same ordering will be always used.        
-        supervised_sampler_train.set_epoch(epoch) # -- update distributed-data-loader epoch
+        supervised_sampler_train.set_epoch(epoch)
         
         loss_meter = AverageMeter()
         time_meter = AverageMeter()
@@ -410,12 +402,8 @@ def main(args, resume_preempt=False):
 
                 def loss_fn(h, targets):
                     loss = criterion(h, targets)
-                    loss = AllReduce.apply(loss)
-                    # TODO: verify below.
-                    # It is not necessary to use another allreduce to sum all loss. 
-                    # Additional allreduce might have considerable negative impact on training speed.
-                    # See: https://discuss.pytorch.org/t/distributeddataparallel-loss-compute-and-backpropogation/47205/4                    
-                    return loss
+                    loss = AllReduce.apply(loss) # Additional allreduce might have considerable negative impact on training speed. See: https://discuss.pytorch.org/t/distributeddataparallel-loss-compute-and-backpropogation/47205/4                    
+                    return loss # TODO: Setup a loss Print (instead of logging it) and see if without all reduce the values are different between different gpus. If so keep all reduce removed.
                             
                 # Step 1. Forward
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
@@ -423,6 +411,18 @@ def main(args, resume_preempt=False):
                     h = target_encoder.forward_features(imgs)
                     reconstructed_input, bottleneck_output = autoencoder(h)
                     AE_loss = F.smooth_l1_loss(reconstructed_input, h)
+                    
+                    # TODO here: either disable amp autocast or 
+                    # convert tensors into float32 inside the k-means module.
+                    #
+                    # K-Means Module:
+                    # In order to perform K-means via batching we have to cache the dataset features so that 
+                    # at the end of each epoch the data is assigned and the centroids updated. 
+                    # TODO: use a dictionary, but it is efficient/compatible?
+                    #    
+
+                    with torch.cuda.amp.autocast(enabled=False):
+                        print('')
 
                     loss = loss_fn(h, targets)
 
