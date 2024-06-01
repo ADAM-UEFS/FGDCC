@@ -2,3 +2,4 @@
 *.DS_Store
 nohup2.out
 *.pth
+*.__

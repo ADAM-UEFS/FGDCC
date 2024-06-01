@@ -61,6 +61,7 @@ from timm.data.mixup import Mixup
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.utils import accuracy
 
+from src import KMeans 
 
 # --
 log_timings = True
@@ -371,6 +372,8 @@ def main(args, resume_preempt=False):
     accum_iter = 1
     start_epoch = resume_epoch
 
+    k_means_module = KMeans(nb_classes, dimensionality=256, k=5)
+
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
         
@@ -384,6 +387,7 @@ def main(args, resume_preempt=False):
 
         target_encoder.train(True)
 
+        cached_features = torch.empty()
         for itr, (sample, target) in enumerate(supervised_loader_train):
             
             def load_imgs():
@@ -392,47 +396,62 @@ def main(args, resume_preempt=False):
 
                 if mixup_fn is not None:
                     samples, targets = mixup_fn(samples, targets)
-
                 return (samples, targets)
+            
             imgs, targets = load_imgs()
 
             def train_step():    
                 _new_lr = scheduler.step() 
                 _new_wd = wd_scheduler.step()
-
-                def loss_fn(h, targets):
+                
+                # Additional allreduce might have considerable negative impact on training speed. See: https://discuss.pytorch.org/t/distributeddataparallel-loss-compute-and-backpropogation/47205/4                    
+                def parent_loss_fn(h, targets):
                     loss = criterion(h, targets)
-                    loss = AllReduce.apply(loss) # Additional allreduce might have considerable negative impact on training speed. See: https://discuss.pytorch.org/t/distributeddataparallel-loss-compute-and-backpropogation/47205/4                    
-                    return loss # TODO: Setup a loss Print (instead of logging it) and see if without all reduce the values are different between different gpus. If so keep all reduce removed.
-                            
-                # Step 1. Forward
+                    loss = AllReduce.apply(loss) 
+                    return loss 
+
+                def subclass_loss_fn(h, targets):
+                    loss = criterion(h, targets)
+                    loss = AllReduce.apply(loss)
+                    return loss 
+
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
-                    #h = target_encoder(imgs)
-                    h = target_encoder.forward_features(imgs)
-                    reconstructed_input, bottleneck_output = autoencoder(h)
+
+                    # Step 1. Forward
+                    h = target_encoder.forward_features(imgs) 
+                    
+                    # Dimensionality Reduction
+                    reconstructed_input, bottleneck_output = autoencoder(h) 
                     AE_loss = F.smooth_l1_loss(reconstructed_input, h)
                     
-                    # TODO here: either disable amp autocast or 
-                    # convert tensors into float32 inside the k-means module.
-                    #
-                    # K-Means Module:
-                    # In order to perform K-means via batching we have to cache the dataset features so that 
-                    # at the end of each epoch the data is assigned and the centroids updated. 
-                    # TODO: use a dictionary, but it is efficient/compatible?
-                    #    
-
+                    # Disable autocast as faiss requires float32
                     with torch.cuda.amp.autocast(enabled=False):
-                        print('')
+                        # Compute K-Means assignments
+                        k_means_loss, k_means_assignments = k_means_module.assign(bottleneck_output, targets)
+                    
+                    # Add K-means distances as penalty term to enforce a k-means friendly space 
+                    AE_loss += k_means_loss
 
-                    loss = loss_fn(h, targets)
+                    y_pred_parent, y_pred_subclass = target_encoder.forward_classifiers(h)
 
+                    loss = parent_loss_fn(y_pred_parent, targets) # TODO: verify whether all reduce should be kept here
+                    
+                    # Compute the loss between predicted subclass and k-means assignments.
+                    subclass_loss = subclass_loss_fn(y_pred_subclass, k_means_assignments)                   
+                    loss += subclass_loss
+                
                 loss_value = loss.item()
                 loss /= accum_iter
                 #  Step 2. Backward & step
                 if use_bfloat16:
                     scaler(loss, optimizer, clip_grad=None,
                                 parameters=target_encoder.parameters(), create_graph=False,
-                                update_grad=(itr + 1) % accum_iter == 0) # Scaling is only necessary when using bfloat16.
+                                update_grad=(itr + 1) % accum_iter == 0) # Scaling is only necessary when using bfloat16.                    
+                    
+                    # FIXME: build a different optimizer for the autoencoder model
+                    scaler(AE_loss, optimizer, clip_grad=None,
+                                parameters=autoencoder.parameters(), create_graph=False,
+                                update_grad=(itr + 1) % accum_iter == 0)
                 else:
                     loss.backward()
                     optimizer.step()
@@ -441,10 +460,13 @@ def main(args, resume_preempt=False):
                 if (itr + 1) % accum_iter == 0:
                     optimizer.zero_grad()
 
-                return (float(loss_value), _new_lr, _new_wd, grad_stats)
+                return (float(loss_value), _new_lr, _new_wd, grad_stats, bottleneck_output)
 
-            (loss, _new_lr, _new_wd, grad_stats), etime = gpu_timer(train_step)
+            (loss, _new_lr, _new_wd, grad_stats, bottleneck_output), etime = gpu_timer(train_step)
             
+            # Guess that reduction should be applied below
+            cached_features = torch.cat((cached_features, [bottleneck_output.to(device=torch.device('cpu'), dtype=torch.float32), target]))
+
             loss_meter.update(loss)
             time_meter.update(etime)
 
@@ -473,6 +495,9 @@ def main(args, resume_preempt=False):
                                         grad_stats.min,
                                         grad_stats.max))
             log_stats()
+        
+        # Perform E step on K-means module
+        k_means_module.update(cached_features)
 
         testAcc1 = AverageMeter()
         testAcc5 = AverageMeter()
@@ -482,7 +507,7 @@ def main(args, resume_preempt=False):
         # will slightly alter validation results as extra duplicate entries are added to achieve equal 
         # num of samples per-process.
         @torch.no_grad()
-        def evaluate(unused_parameters=None):
+        def evaluate():
             crossentropy = torch.nn.CrossEntropyLoss()
 
             target_encoder.eval()              

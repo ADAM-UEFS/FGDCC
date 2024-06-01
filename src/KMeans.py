@@ -31,12 +31,19 @@ import faiss.contrib.torch_utils
                         
     --
         - Questions:
-            -      
+            - How often do we call the update step In terms of frequency of epochs? 
+            - Should we use the same matrix across all epochs or restart the training on the basis of an x number of epochs?      
 
-        - TODO (Ideas):
+        - TODO (Ideas/Ablation):
             - Implement other stopping criteria (e.g., inertia).
             - Keep track of the average no. of iterations to converge and log this.
             - Keep track of the classes that are presenting empty clusters (log as well). 
+            - How frequently should we perform E on the k-means? 
+                I sense that we could use a scheduler to increase the amount of epochs before performing E
+                e.g., start with 1 and double on every 10 epochs;
+                e.g., start with 1 for 10 epochs then double it on every 5. 
+
+
 '''
 class KMeansModule:
     
@@ -49,12 +56,22 @@ class KMeansModule:
         self.n_kmeans = [faiss.Kmeans(d=dimensionality, k=k, niter=1, gpu=True, verbose=True) for _ in nb_classes]         
 
 
-    def assign(self, x_i, y_i):
-        # Train K-means model for one iteration to initialize centroids
-        self.n_kmeans[y_i].train(x_i)
-        # Assign vectors to the nearest cluster centroid
-        D, I = self.n_kmeans[y_i].index.search(x_i, 1)
-        return D, I
+    def assign(self, x, y):
+        #D_batch = torch.empty()
+        #I_batch = torch.empty()
+        for i in range(len(x)):
+            # Train K-means model for one iteration to initialize centroids
+            self.n_kmeans[y[i]].train(x[i])
+            # Assign vectors to the nearest cluster centroid
+            D, I = self.n_kmeans[y[i]].index.search(x[i], 1)
+
+            D_batch = torch.cat((D_batch, D))
+            I_batch = torch.cat((I_batch, I))
+        return D_batch, I_batch
+
+    def update(self, features):
+        return 0
+
 
     # TODO: ensure that xb have been previously sent to a device 
     # What happens when we send a tensor to a device? []
@@ -62,7 +79,7 @@ class KMeansModule:
                 
         for _ in range(self.n_iter - 1):  # n_iter-1 because we already did one iteration
             # Assign vectors to the nearest cluster centroid
-            D, I = self.kmeans.index.search(xb, 1) # TODO: what is the shape of I[]
+            D, I = self.n_kmeans.index.search(xb, 1) # TODO: what is the shape of I[]
              
             # Initialize tensors to store new centroids and counts
             new_centroids = torch.zeros((self.k, self.d), dtype=torch.float32, device=device)
@@ -84,9 +101,9 @@ class KMeansModule:
             new_centroids_np = new_centroids.cpu().numpy()
 
             # Update the centroids in the FAISS index
-            self.kmeans.centroids = new_centroids_np
-            self.kmeans.index.reset()
-            self.kmeans.index.add(new_centroids_np)
+            self.n_kmeans.centroids = new_centroids_np
+            self.n_kmeans.index.reset()
+            self.n_kmeans.index.add(new_centroids_np)
         
         # TODO: Verify the shape of D, and whether we should return the final value or its mean across the iterations. 
-        return self.kmeans, D
+        return self.n_kmeans, D

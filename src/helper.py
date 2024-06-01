@@ -119,64 +119,14 @@ class FinetuningModel(nn.Module):
         self.n_intermediate_outputs = 4
 
         self.average_pool = nn.AvgPool1d((self.pretrained_model.patch_embed.num_patches), stride=1)
-        #self.average_pool = nn.AvgPool1d((self.pretrained_model.embed_dim), stride=1)
-
-        #self.mlp_head = nn.Linear(self.n_intermediate_outputs * self.pretrained_model.embed_dim,
-        #                            self.nb_classes)
 
         self.head_drop = nn.Dropout(drop_path)
 
-        self.mlp_head = nn.Linear(self.pretrained_model.embed_dim,
+        self.parent_classifier = nn.Linear(self.pretrained_model.embed_dim,
                                   self.nb_classes)
 
-    '''
-        " Because our I-JEPA implementation uses Vision Transformer architectures without a [cls] token, 
-        we adapt the default VISSL evaluation recipe to utilize the average-pooled patch representation
-        instead of the [cls] token. 
-        We therefore report the best linear evaluation number among the following representations: 
-        1) the average-pooled patch representation of the last layer,
-        2) the concatenation of the last 4 layers of the average-pooled patch representations."    
-    '''
-    def get_n_intermediate_outputs(self, n , x):
-
-        # -- patchify x
-        x = self.pretrained_model.patch_embed(x) # -> (B, 256, 1280)
-
-        # -- add positional embedding to x 
-        pos_embed = self.pretrained_model.interpolate_pos_encoding(x, self.pretrained_model.pos_embed) # See vision_transformer.py @Line 410 for more info.
-        x = x + pos_embed
-        
-        # Extract the representation (B, 256, 1280) from the last 4 layers
-        # averaging them individually -> 4x (B, 1, 1280), then
-        # concatenate into a single representation (B, 5120).
-        outputs = []
-        n_blocks = len(self.pretrained_model.blocks) - 1            
-        layers = [(n_blocks - i) for i in reversed(range(n))]
-        # -- 1. fwd prop
-        for b, blk in enumerate(self.pretrained_model.blocks):
-            x = blk(x)
-            # -- 2. Patch-wise averaging and normalization.
-            if b in layers:
-                print('Block:', blk) # TODO: Finish debug
-                h = self.average_pool(x.transpose(1, 2)).transpose(1, 2)
-                h = h.squeeze(1) # adjust
-                h = F.layer_norm(h, (h.size(-1),)) # Normalize over feature-dim    
-                outputs.append(h)
-
-        # -- 3. Concatenation
-        output = torch.cat(outputs, dim=-1)
-        exit(0) # TODO: REMOVE THIS
-        return output
-
-    def forward_v2(self, x):
-
-        x = self.get_n_intermediate_outputs(self.n_intermediate_outputs, x)
-        
-        x = self.head_drop(x) # As performed in timm.models
-        
-        x = self.mlp_head(x)
-        return x
-
+        # FIXME currently a sketch.
+        self.subclass_classifier = nn.Linear(self.nb_classes, 5)
 
     def forward_features(self, x):
         x = self.pretrained_model(x)
@@ -185,7 +135,16 @@ class FinetuningModel(nn.Module):
         
         x = F.layer_norm(x, (x.size(-1),))  # normalize over feature-dim 
 
-        return x 
+        return x
+
+    def forward_classifiers(self, h):
+        h = self.head_drop(h) 
+        
+        y_parent_pred = self.parent_classifier(h)
+        y_subclass_pred = self.subclass_classifier(y_parent_pred)
+        
+        return y_parent_pred, y_subclass_pred
+
 
     def forward(self, x):
 
@@ -205,7 +164,8 @@ def add_classification_head(pretrained_model, drop_path, nb_classes, device):
     model = FinetuningModel(pretrained_model, drop_path, nb_classes)
     
     # manually initialize fc layer (borrowed from MAE)
-    trunc_normal_(model.mlp_head.weight, std=2e-5) 
+    trunc_normal_(model.parent_classifier.weight, std=2e-5) 
+    trunc_normal_(model.subclass_classifier.weight, std=2e-5) 
     
     model.to(device)
     return model         
