@@ -417,27 +417,30 @@ def main(args, resume_preempt=False):
 
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
 
-                    # Step 1. Forward
-                    h = target_encoder.forward_features(imgs) 
+                    # Step 1. Forward into the encoder
+                    h = target_encoder(imgs) 
                     
-                    # Dimensionality Reduction
+                    # Step 2. Autoencoder Dimensionality Reduction  
                     reconstructed_input, bottleneck_output = autoencoder(h) 
-                    AE_loss = F.smooth_l1_loss(reconstructed_input, h)
+                    AE_loss = F.smooth_l1_loss(reconstructed_input, h) # TODO: verify whether does activation has to be performed in the features or not.
                     
-                    # Disable autocast as faiss requires float32
-                    with torch.cuda.amp.autocast(enabled=False):
-                        # Compute K-Means assignments
+                    # Step 3. Compute K-Means assignments (Disable autocast as faiss requires float32)
+                    with torch.cuda.amp.autocast(enabled=False): 
                         k_means_loss, k_means_assignments = k_means_module.assign(bottleneck_output, targets)
                     
-                    # Add K-means distances as penalty term to enforce a k-means friendly space 
+                    # Add K-means distances term as penalty to enforce a k-means friendly space 
                     AE_loss += k_means_loss
 
+                    # Step 4. Hierarchical Classification
                     y_pred_parent, y_pred_subclass = target_encoder.forward_classifiers(h)
 
                     loss = parent_loss_fn(y_pred_parent, targets) # TODO: verify whether all reduce should be kept here
                     
+                    # TODO: how to efficiently concat the targets (that is, on the correct order) with the k_means assignments in the format [p, s] (parent, subclass)
+                    # so as we can allow the model to predict the most likely pair of labels in the space of the cartesian product between subclass and parent labels.
                     # Compute the loss between predicted subclass and k-means assignments.
-                    subclass_loss = subclass_loss_fn(y_pred_subclass, k_means_assignments)                   
+                    subclass_loss = subclass_loss_fn(y_pred_subclass, k_means_assignments)                    
+                    
                     loss += subclass_loss
                 
                 loss_value = loss.item()

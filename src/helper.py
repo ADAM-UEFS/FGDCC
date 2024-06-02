@@ -106,29 +106,30 @@ def load_FT_checkpoint(
     return target_encoder, opt, scaler, epoch
 
 class FinetuningModel(nn.Module):
-    def __init__(self, pretrained_model, drop_path, nb_classes):
+    def __init__(self, pretrained_model, drop_path, nb_classes, K=5):
         super(FinetuningModel, self).__init__()        
         self.pretrained_model = pretrained_model
         
+        self.nb_subclasses = K
+
         self.drop_path = drop_path
         self.nb_classes = nb_classes
         
-        self.pretrained_model.drop_path = 0.2  # Does it change anything after the model has been loaded?
+        self.pretrained_model.drop_path = 0.2
         self.pretrained_model.drop_rate = 0.25
         
-        self.n_intermediate_outputs = 4
-
-        self.average_pool = nn.AvgPool1d((self.pretrained_model.patch_embed.num_patches), stride=1)
-
         self.head_drop = nn.Dropout(drop_path)
 
         self.parent_classifier = nn.Linear(self.pretrained_model.embed_dim,
-                                  self.nb_classes)
+                                           self.nb_classes)
 
-        # FIXME currently a sketch.
-        self.subclass_classifier = nn.Linear(self.nb_classes, 5)
+        self.intermediate_layer = nn.Linear(self.pretrained_model.embed_dim,
+                                       self.nb_subclasses)
 
-    def forward_features(self, x):
+        self.subclass_classifier = nn.Linear(self.nb_classes * self.nb_subclasses,
+                                             self.nb_subclasses)
+
+    def forward(self, x):
         x = self.pretrained_model(x)
 
         x = torch.mean(x, dim=1)
@@ -137,16 +138,65 @@ class FinetuningModel(nn.Module):
 
         return x
 
+    '''
+    # Another Idea:
+     I guess that another possibility of doing classification hierarchically 
+     is by setting up a classifier for each subclass. 
+     This way, we'd have an array of linear layers with one-to-one correspondence between parent and subclasses.
+     We could then make conditioned predictions by using the prediction from the parent class as index to the array of linear classifiers.
+     Then we'd predict the subclass, given that we used the parent classifier prediction to select the subclass classifier.
+     
+     Questions:
+        Which one should make more sense?
+        This one seems rather insightful but it doesn't explicitly uses a product between probabilities as information as input to the criterion
+        which is a bit counterintuitive. On the other hand, it seems more "semantically alligned" with, let us say, this "type of programming" 
+        that we'd have one classifier for each set of classes, which it's not the further case. 
+
+        It also seems more semantically alligned with our purpose, that we'd have separate classifiers for each subclass, such that
+        it allows the model to learn explicit features for each subclass in a less fuzzier way. 
+
+        Should we use the prediction as index, or should we use the parent (target) label directly? Does that configures cheating? Does by
+        using the target directly we "disconnect" the information flow of the hierarchy? 
+
+        TODO: Reconsider below (approach no. 3).
+        Should we instead train the model to predict the cartesian product between the probabilities, instead of using the cartesian
+        product as information, that is, input to a linear layer that will learns the weights for each pair/product? 
+        
+        I sense that this is an idea that unifies both approaches. It's scalable and reasonable.  
+        Because, that is also the problem that, for our case which involves K=5, so, for problems with a small number of subclasses,
+        those approaches (1 and 2), approaches that involves predicting the correct subclass are more prone to the effects randomness
+        that is, for our K=5 subclasses example, the probability that the model outputs a correct class by random chance is 20%. 
+        Perhaps the model wouldn't choose random strategy because it is not much successful, but to which extent this can worsen 
+        the learning process by confusion? My guess is that randomness could help because it could have a strong effect in cases
+        of lower values of K, and therefore, it could affect the learning process negatively. 
+
+        Otherwise, if we try to predict a cartesian product between the two labels, in cases of a higher amount of classes, and subclasses
+        the chance of randomness playing a substantial role in learning diminishes significantly.
+
+        TODO: Rethink this approach as trying to predict cartesian products will imply the model to have to learn to predict not only the correct 
+        outputs, but the incorrect ones as well? Perhaps it will turn the problem even harder. Perhaps dropping 0 values would be a viable solution. 
+        Perhaps what we are calling cartesian product is not the correct name of it, perhaps the model should predict the pair of compatible labels instead.   
+    '''
     def forward_classifiers(self, h):
         h = self.head_drop(h) 
         
-        y_parent_pred = self.parent_classifier(h)
-        y_subclass_pred = self.subclass_classifier(y_parent_pred)
+        # Output the prediction correspondent to the label provided by the dataset (Y_p) 
+        y_parent_pred = self.parent_classifier(h) # P(Y_p | x)
+        
+        # TODO: confirm below hypothesis...
+        # As we haven't provided any specific criterion to the intermediate layer such that it learns to output probabilities,
+        # it therefore seems to me that it is more insightful that we should in turn apply softmax on top of those so that
+        # we'd then could have a product of probabilities as input to the subclass prediction layer. 
+        y_subclass_pred = self.intermediate_layer(h)
+        y_subclass_pred = torch.nn.Softmax(y_subclass_pred) # P(Y_s | x)
+        y_subclass_pred = torch.cartesian_prod(y_subclass_pred, y_parent_pred)
+
+        y_subclass_pred = self.subclass_classifier(y_parent_pred) # P(Y_s | x, Y_p) = P(Y_s | x) * P(Y_p | x)
         
         return y_parent_pred, y_subclass_pred
 
 
-    def forward(self, x):
+    def forward_parent_classifier(self, x):
 
         x = self.pretrained_model(x)
 
@@ -156,16 +206,22 @@ class FinetuningModel(nn.Module):
         
         x = self.head_drop(x) # As in in timm.models
         
-        x = self.mlp_head(x)
+        x = self.parent_classifier(x)
         return x
 
     
 def add_classification_head(pretrained_model, drop_path, nb_classes, device):
     model = FinetuningModel(pretrained_model, drop_path, nb_classes)
-    
-    # manually initialize fc layer (borrowed from MAE)
-    trunc_normal_(model.parent_classifier.weight, std=2e-5) 
-    trunc_normal_(model.subclass_classifier.weight, std=2e-5) 
+
+    def initialize(m):
+        trunc_normal_(m.weight, std=2e-5)
+        if m.bias is not None:
+            torch.nn.init.constant_(m.bias, 0)
+
+    # manually initialize fc layers
+    initialize(model.parent_classifier)
+    initialize(model.intermediate_layer)
+    initialize(model.subclass_classifier)
     
     model.to(device)
     return model         
