@@ -105,6 +105,47 @@ def load_FT_checkpoint(
 
     return target_encoder, opt, scaler, epoch
 
+
+
+class ParentClassifier(nn.Module):
+    def __init__(self, input_dim, num_parents):
+        super(ParentClassifier, self).__init__()
+        self.fc = nn.Linear(input_dim, num_parents)
+    
+    def forward(self, x):
+        return self.fc(x)
+
+class ChildClassifier(nn.Module):
+    def __init__(self, input_dim, num_children):
+        super(ChildClassifier, self).__init__()
+        self.fc = nn.Linear(input_dim, num_children)
+    
+    def forward(self, x):
+        return self.fc(x)
+
+class HierarchicalClassifier(nn.Module):
+    def __init__(self, input_dim, num_parents, num_children_per_parent):
+        super(HierarchicalClassifier, self).__init__()
+        self.parent_classifier = ParentClassifier(input_dim, num_parents)
+        self.child_classifiers = nn.ModuleList(
+            [ChildClassifier(input_dim, num_children_per_parent) for _ in range(num_parents)]
+        )
+    
+    def forward(self, x):
+        parent_logits = self.parent_classifier(x)  # Shape (batch_size, num_parents)
+        parent_probs = F.softmax(parent_logits, dim=1)  # Softmax over class dimension
+
+        # Predict parent class
+        parent_class = torch.argmax(parent_probs, dim=1)  # Argmax over class dimension
+
+        # Use the predicted parent class to select the corresponding child classifier
+        child_logits = torch.zeros(x.size(0), 5)  # Assuming each parent has exactly 5 children
+        for i in range(x.size(0)):  # Iterate over each sample in the batch
+            child_logits[i] = self.child_classifiers[parent_class[i]](x[i])
+        
+        return parent_logits, child_logits
+
+
 class FinetuningModel(nn.Module):
     def __init__(self, pretrained_model, drop_path, nb_classes, K=5):
         super(FinetuningModel, self).__init__()        
@@ -123,11 +164,11 @@ class FinetuningModel(nn.Module):
         self.parent_classifier = nn.Linear(self.pretrained_model.embed_dim,
                                            self.nb_classes)
 
-        self.intermediate_layer = nn.Linear(self.pretrained_model.embed_dim,
-                                       self.nb_subclasses)
+        #self.intermediate_layer = nn.Linear(self.pretrained_model.embed_dim,
+                                       #self.nb_subclasses)
 
-        self.subclass_classifier = nn.Linear(self.nb_classes * self.nb_subclasses,
-                                             self.nb_subclasses)
+        self.subclass_classifier = nn.Linear(self.pretrained_model.embed_dim,
+                                             self.nb_classes * self.nb_subclasses)
 
     def forward(self, x):
         x = self.pretrained_model(x)
@@ -177,21 +218,16 @@ class FinetuningModel(nn.Module):
         outputs, but the incorrect ones as well? Perhaps it will turn the problem even harder. Perhaps dropping 0 values would be a viable solution. 
         Perhaps what we are calling cartesian product is not the correct name of it, perhaps the model should predict the pair of compatible labels instead.   
     '''
-    def forward_classifiers(self, h):
-        h = self.head_drop(h) 
+    def forward_classifiers(self, h): 
         
-        # Output the prediction correspondent to the label provided by the dataset (Y_p) 
-        y_parent_pred = self.parent_classifier(h) # P(Y_p | x)
+        # Output the prediction correspondent to the label provided by the dataset i.e., P(Y_p | h)
+        y_parent_pred = self.parent_classifier(self.head_drop(h)) 
         
-        # TODO: confirm below hypothesis...
-        # As we haven't provided any specific criterion to the intermediate layer such that it learns to output probabilities,
-        # it therefore seems to me that it is more insightful that we should in turn apply softmax on top of those so that
-        # we'd then could have a product of probabilities as input to the subclass prediction layer. 
-        y_subclass_pred = self.intermediate_layer(h)
-        y_subclass_pred = torch.nn.Softmax(y_subclass_pred) # P(Y_s | x)
-        y_subclass_pred = torch.cartesian_prod(y_subclass_pred, y_parent_pred)
+        # P(Y_s | h)
+        y_subclass_pred = self.subclass_classifier(self.head_drop(h)) # Hoping that this dropout operation is performed sequentially otherwise will require a bunch of memory
 
-        y_subclass_pred = self.subclass_classifier(y_parent_pred) # P(Y_s | x, Y_p) = P(Y_s | x) * P(Y_p | x)
+        # This allows to predict the joint probability of both classes assuming that they are independent, i.e., P(Y_p, Y_s | h) = P(Y_s | h) * P(Y_p | h)
+        y_subclass_pred = torch.cartesian_prod(y_subclass_pred, y_parent_pred) # But do we really want to assume independence? 
         
         return y_parent_pred, y_subclass_pred
 
