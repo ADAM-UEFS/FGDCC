@@ -43,10 +43,13 @@ import faiss.contrib.torch_utils
                 e.g., start with 1 and double on every 10 epochs;
                 e.g., start with 1 for 10 epochs then double it on every 5. 
 
-
 '''
 class KMeansModule:
-    
+
+    # TODO (1): Adapt to handle a range of classes e.g., K=[2,3,4,5] and test.
+    # (2) Build a test case to integrate to the hierarchical classification module.
+    # (3) GPU testing?. 
+
     def __init__(self, nb_classes, dimensionality=256, n_iter=10, k=5, max_iter=300):
 
         # Create the K-means object

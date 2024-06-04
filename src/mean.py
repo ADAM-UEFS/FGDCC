@@ -1,6 +1,6 @@
 
 import PIL
-from datasets.PlantCLEF2022 import make_PlantCLEF2022
+from datasets.FineTuningDataset import make_PlantCLEF2022
 import torchvision.transforms as transforms
 import torchvision
 import torch

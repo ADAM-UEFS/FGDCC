@@ -43,7 +43,7 @@ from src.utils.logging import (
 
 from src.utils.tensors import repeat_interleave_batch
 from src.datasets.imagenet1k import make_imagenet1k
-from src.datasets.PlantCLEF2022 import make_PlantCLEF2022
+from datasets.FineTuningDataset import make_FinetuningDataset
 
 from src.helper import (
     add_classification_head,
@@ -229,7 +229,7 @@ def main(args, resume_preempt=False):
         color_jitter=color_jitter)
 
     # -- init data-loaders/samplers
-    _, supervised_loader_train, supervised_sampler_train = make_PlantCLEF2022(
+    _, supervised_loader_train, supervised_sampler_train = make_FinetuningDataset(
             transform=training_transform,
             batch_size=batch_size,
             collator=None,
@@ -248,7 +248,7 @@ def main(args, resume_preempt=False):
     # Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. 
     # This will slightly alter validation results as extra duplicate entries are added to achieve
     # equal num of samples per-process.'
-    _, supervised_loader_val, supervised_sampler_val = make_PlantCLEF2022(
+    _, supervised_loader_val, supervised_sampler_val = make_FinetuningDataset(
             transform=val_transform,
             batch_size=batch_size,
             collator= None,
@@ -371,16 +371,16 @@ def main(args, resume_preempt=False):
     
     accum_iter = 1
     start_epoch = resume_epoch
-
+    
+    K_range = [2,3,4,5]
     k_means_module = KMeans(nb_classes, dimensionality=256, k=5)
 
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
         
         logger.info('Epoch %d' % (epoch + 1))
-        # In distributed mode, calling the set_epoch() method at the beginning of each epoch before creating the DataLoader iterator is necessary to make shuffling work properly across multiple epochs.
-        # Otherwise, the same ordering will be always used.        
-        supervised_sampler_train.set_epoch(epoch)
+
+        supervised_sampler_train.set_epoch(epoch) # Calling the set_epoch() method at the beginning of each epoch before creating the DataLoader iterator is necessary to make shuffling work properly across multiple epochs.
         
         loss_meter = AverageMeter()
         time_meter = AverageMeter()
@@ -405,14 +405,9 @@ def main(args, resume_preempt=False):
                 _new_wd = wd_scheduler.step()
                 
                 # Additional allreduce might have considerable negative impact on training speed. See: https://discuss.pytorch.org/t/distributeddataparallel-loss-compute-and-backpropogation/47205/4                    
-                def parent_loss_fn(h, targets):
+                def loss_fn(h, targets):
                     loss = criterion(h, targets)
                     loss = AllReduce.apply(loss) 
-                    return loss 
-
-                def subclass_loss_fn(h, targets):
-                    loss = criterion(h, targets)
-                    loss = AllReduce.apply(loss)
                     return loss 
 
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
@@ -422,29 +417,37 @@ def main(args, resume_preempt=False):
                     
                     # Step 2. Autoencoder Dimensionality Reduction  
                     reconstructed_input, bottleneck_output = autoencoder(h) 
-                    AE_loss = F.smooth_l1_loss(reconstructed_input, h) # TODO: verify whether does activation has to be performed in the features or not.
+                    reconstruction_loss = F.smooth_l1_loss(reconstructed_input, h) # TODO: verify whether does activation has to be performed in the features or not.
                     
-                    # Step 3. Compute K-Means assignments (Disable autocast as faiss requires float32)
+                    # Step 3. Compute K-Means assignments with disabled autocast as faiss requires float32
                     with torch.cuda.amp.autocast(enabled=False): 
-                        k_means_loss, k_means_assignments = k_means_module.assign(bottleneck_output, targets)
+                        # Outputs should be a list of items in the shape:
+                        # [(batch_size), (batch_size, K)]: the distances to the nearest clusters, and the cluster assignments for each image in the batch, for each value of K within its range
+                        k_means_loss, k_means_assignments = k_means_module.assign(bottleneck_output, targets)  
                     
                     # Add K-means distances term as penalty to enforce a k-means friendly space 
-                    AE_loss += k_means_loss
+                    reconstruction_loss += k_means_loss
 
+                    # TODO (1) TEST THIS SECTION, integrate with K-means module.
+                    #####################################################################################################################
+                    #
                     # Step 4. Hierarchical Classification
-                    y_pred_parent, y_pred_subclass = target_encoder.forward_classifiers(h)
+                    parent_logits, child_logits = target_encoder.hierarchical_classification(h)
 
-                    loss = parent_loss_fn(y_pred_parent, targets) # TODO: verify whether all reduce should be kept here
-                    
-                    # TODO: how to efficiently concat the targets (that is, on the correct order) with the k_means assignments in the format [p, s] (parent, subclass)
-                    # so as we can allow the model to predict the most likely pair of labels in the space of the cartesian product between subclass and parent labels.
-                    # Compute the loss between predicted subclass and k-means assignments.
-                    subclass_loss = subclass_loss_fn(y_pred_subclass, k_means_assignments)                    
-                    
+                    loss = loss_fn(parent_logits, targets) # TODO: verify whether all reduce should be kept here or somewhere else
+                                        
+                    # Model selection: Iterate through every K classifier computing the loss then select the one with smallest value 
+                    subclass_loss = [loss_fn(child_logits[i], k_means_assignments[i]) for i in range(len(K_range))]                    
+                    subclass_loss = subclass_loss[torch.argmin(torch.cat(subclass_loss), dim=0)]
+                    # 
+                    #####################################################################################################################
                     loss += subclass_loss
                 
                 loss_value = loss.item()
+                reconstruction_loss_value = reconstruction_loss.item() # TODO: LOGGING[]
+
                 loss /= accum_iter
+                reconstruction_loss /= accum_iter
                 #  Step 2. Backward & step
                 if use_bfloat16:
                     scaler(loss, optimizer, clip_grad=None,
@@ -452,7 +455,7 @@ def main(args, resume_preempt=False):
                                 update_grad=(itr + 1) % accum_iter == 0) # Scaling is only necessary when using bfloat16.                    
                     
                     # FIXME: build a different optimizer for the autoencoder model
-                    scaler(AE_loss, optimizer, clip_grad=None,
+                    scaler(reconstruction_loss, optimizer, clip_grad=None,
                                 parameters=autoencoder.parameters(), create_graph=False,
                                 update_grad=(itr + 1) % accum_iter == 0)
                 else:
@@ -463,11 +466,12 @@ def main(args, resume_preempt=False):
                 if (itr + 1) % accum_iter == 0:
                     optimizer.zero_grad()
 
+                # TODO: adjust return
                 return (float(loss_value), _new_lr, _new_wd, grad_stats, bottleneck_output)
 
             (loss, _new_lr, _new_wd, grad_stats, bottleneck_output), etime = gpu_timer(train_step)
             
-            # Guess that reduction should be applied below
+            # TODO VERIFY: Guess that reduction should be applied below
             cached_features = torch.cat((cached_features, [bottleneck_output.to(device=torch.device('cpu'), dtype=torch.float32), target]))
 
             loss_meter.update(loss)
@@ -499,7 +503,7 @@ def main(args, resume_preempt=False):
                                         grad_stats.max))
             log_stats()
         
-        # Perform E step on K-means module
+        # Perform M step on K-means module
         k_means_module.update(cached_features)
 
         testAcc1 = AverageMeter()

@@ -71,7 +71,7 @@ def build_transform(is_train, args):
     t.append(transforms.Normalize(mean, std))
     return transforms.Compose(t)
 
-def make_PlantCLEF2022(
+def make_FinetuningDataset(
     transform,
     batch_size,
     collator=None,
@@ -101,7 +101,7 @@ def make_PlantCLEF2022(
 
     dataset = build_dataset(is_train=training) 
 
-    logger.info('PlantCLEF dataset created')
+    logger.info('Finetuning dataset created')
 
     dist_sampler = torch.utils.data.distributed.DistributedSampler(
         dataset=dataset,

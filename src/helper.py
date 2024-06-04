@@ -110,7 +110,10 @@ class ParentClassifier(nn.Module):
     def __init__(self, input_dim, num_parents):
         super(ParentClassifier, self).__init__()
         self.fc = nn.Linear(input_dim, num_parents)
-    
+        trunc_normal_(self.fc.weight, std=2e-5)
+        if self.fc.bias is not None:
+            torch.nn.init.constant_(self.fc.bias, 0)
+
     def forward(self, x):
         return self.fc(x)
 
@@ -118,11 +121,15 @@ class ChildClassifier(nn.Module):
     def __init__(self, input_dim, num_children):
         super(ChildClassifier, self).__init__()
         self.fc = nn.Linear(input_dim, num_children)
+        trunc_normal_(self.fc.weight, std=2e-5)
+        if self.fc.bias is not None:
+            torch.nn.init.constant_(self.fc.bias, 0)
     
     def forward(self, x):
         return self.fc(x)
 
 '''
+    Hierarchical Classifier
     ----------
     num_parents: int
         Number of parent classes.
@@ -135,11 +142,16 @@ class ChildClassifier(nn.Module):
         to predict the K-means assignment correspondent to each value of K and the one to make the most accurate prediction will be selected 
         for backpropagation.   
 
-        One concern with this approach is that 
+        One concern with this approach is that the probability that randomness plays a bigger role in the subclass prediction
+        increases inversely with the number of K. In other words, if a random subclass classifier learns how to produce one hot 
+        vectors, regardless of its semantic meaning, the chance that it correctly guess a subclass is 25% for K=2. If it does 
+        learns that every subclass classifier with output size = K = 2 could either be [0, 1] or [1, 0], the probability
+        that it generates a correct output at random is 50%. One way to prevent this from happening perhaps is by forcing it
+        to make predictions in the space of the cartesian product between K-means assingments and ground truth labels.
 
 '''
 class HierarchicalClassifier(nn.Module):
-    def __init__(self, input_dim, num_parents, num_children_per_parent=[2,3,4,5]):
+    def __init__(self, input_dim, num_parents, num_children_per_parent):
         super(HierarchicalClassifier, self).__init__()
         self.num_parents = num_parents
         self.num_children_per_parent = num_children_per_parent
@@ -149,7 +161,7 @@ class HierarchicalClassifier(nn.Module):
                 [ChildClassifier(input_dim, num_children) for _ in range(num_parents)]
             ) for num_children in num_children_per_parent]    
         )
-    
+
     def forward(self, x):
         parent_logits = self.parent_classifier(x)  # Shape (batch_size, num_parents)
         parent_probs = F.softmax(parent_logits, dim=1)  # Softmax over class dimension
@@ -167,11 +179,9 @@ class HierarchicalClassifier(nn.Module):
 
 
 class FinetuningModel(nn.Module):
-    def __init__(self, pretrained_model, drop_path, nb_classes, K=5, K_range = [2,3,4,5]):
+    def __init__(self, pretrained_model, drop_path, nb_classes, K_range = [2,3,4,5]):
         super(FinetuningModel, self).__init__()        
         self.pretrained_model = pretrained_model
-        
-        self.nb_subclasses = K
 
         self.drop_path = drop_path
         self.nb_classes = nb_classes
@@ -181,23 +191,29 @@ class FinetuningModel(nn.Module):
         
         self.head_drop = nn.Dropout(drop_path)
 
-        self.parent_classifier = nn.Linear(self.pretrained_model.embed_dim,
-                                           self.nb_classes)
+        self.hierarchical_classifier = HierarchicalClassifier(input_dim=self.pretrained_model.embed_dim,
+                                                              num_parents=self.nb_classes,
+                                                              num_children_per_parent=K_range)
 
-        #self.intermediate_layer = nn.Linear(self.pretrained_model.embed_dim,
-                                       #self.nb_subclasses)
-
-        self.subclass_classifier = nn.Linear(self.pretrained_model.embed_dim,
-                                             self.nb_classes * self.nb_subclasses)
-
+    '''
+        Returns normalized features only.
+    '''
     def forward(self, x):
         x = self.pretrained_model(x)
 
         x = torch.mean(x, dim=1)
+        x = torch.squeeze(x, dim=1)
         
         x = F.layer_norm(x, (x.size(-1),))  # normalize over feature-dim 
 
         return x
+    
+    def hierarchical_classification(self, x):
+        x = self.head_drop(x)
+        
+        parent_logits, child_logits = self.hierarchical_classifier(x)
+
+        return parent_logits, child_logits
 
     '''
     # Another Idea:
@@ -267,18 +283,7 @@ class FinetuningModel(nn.Module):
 
     
 def add_classification_head(pretrained_model, drop_path, nb_classes, device):
-    model = FinetuningModel(pretrained_model, drop_path, nb_classes)
-
-    def initialize(m):
-        trunc_normal_(m.weight, std=2e-5)
-        if m.bias is not None:
-            torch.nn.init.constant_(m.bias, 0)
-
-    # manually initialize fc layers
-    initialize(model.parent_classifier)
-    initialize(model.intermediate_layer)
-    initialize(model.subclass_classifier)
-    
+    model = FinetuningModel(pretrained_model, drop_path, nb_classes)    
     model.to(device)
     return model         
         

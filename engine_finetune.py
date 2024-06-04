@@ -42,7 +42,7 @@ from src.utils.logging import (
     AverageMeter)
 from src.utils.tensors import repeat_interleave_batch
 from src.datasets.imagenet1k import make_imagenet1k
-from src.datasets.PlantCLEF2022 import make_PlantCLEF2022
+from datasets.FineTuningDataset import make_FinetuningDataset
 
 from src.helper import (
     add_classification_head,
@@ -224,7 +224,7 @@ def main(args, resume_preempt=False):
         color_jitter=color_jitter)
 
     # -- init data-loaders/samplers
-    _, supervised_loader_train, supervised_sampler_train = make_PlantCLEF2022(
+    _, supervised_loader_train, supervised_sampler_train = make_FinetuningDataset(
             transform=training_transform,
             batch_size=batch_size,
             collator=None,
@@ -243,7 +243,7 @@ def main(args, resume_preempt=False):
     # Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. 
     # This will slightly alter validation results as extra duplicate entries are added to achieve
     # equal num of samples per-process.'
-    _, supervised_loader_val, supervised_sampler_val = make_PlantCLEF2022(
+    _, supervised_loader_val, supervised_sampler_val = make_FinetuningDataset(
             transform=val_transform,
             batch_size=batch_size,
             collator= None,
