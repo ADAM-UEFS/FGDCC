@@ -106,7 +106,6 @@ def load_FT_checkpoint(
     return target_encoder, opt, scaler, epoch
 
 
-
 class ParentClassifier(nn.Module):
     def __init__(self, input_dim, num_parents):
         super(ParentClassifier, self).__init__()
@@ -123,31 +122,52 @@ class ChildClassifier(nn.Module):
     def forward(self, x):
         return self.fc(x)
 
+'''
+    ----------
+    num_parents: int
+        Number of parent classes.
+
+    num_children_per_parent: list 
+
+        This allows for model selection, i.e., finding the optimal value of K.
+        
+        We associate 1 classifier of shape (embed_dim, K) for each K in the range within num_children_per_parent. Each one will then be used 
+        to predict the K-means assignment correspondent to each value of K and the one to make the most accurate prediction will be selected 
+        for backpropagation.   
+
+        One concern with this approach is that 
+
+'''
 class HierarchicalClassifier(nn.Module):
-    def __init__(self, input_dim, num_parents, num_children_per_parent):
+    def __init__(self, input_dim, num_parents, num_children_per_parent=[2,3,4,5]):
         super(HierarchicalClassifier, self).__init__()
+        self.num_parents = num_parents
+        self.num_children_per_parent = num_children_per_parent
         self.parent_classifier = ParentClassifier(input_dim, num_parents)
         self.child_classifiers = nn.ModuleList(
-            [ChildClassifier(input_dim, num_children_per_parent) for _ in range(num_parents)]
+            [nn.ModuleList(
+                [ChildClassifier(input_dim, num_children) for _ in range(num_parents)]
+            ) for num_children in num_children_per_parent]    
         )
     
     def forward(self, x):
         parent_logits = self.parent_classifier(x)  # Shape (batch_size, num_parents)
         parent_probs = F.softmax(parent_logits, dim=1)  # Softmax over class dimension
 
-        # Predict parent class
-        parent_class = torch.argmax(parent_probs, dim=1)  # Argmax over class dimension
+        # The parent class prediction allows to select the index for the correspondent subclass classifier
+        parent_class = torch.argmax(parent_probs, dim=1)  # Argmax over class dimension: Shape (batch_size)
 
         # Use the predicted parent class to select the corresponding child classifier
-        child_logits = torch.zeros(x.size(0), 5)  # Assuming each parent has exactly 5 children
-        for i in range(x.size(0)):  # Iterate over each sample in the batch
-            child_logits[i] = self.child_classifiers[parent_class[i]](x[i])
-        
+        child_logits = [torch.zeros(x.size(0), num) for num in self.num_children_per_parent] # Each element within child_logits is associated to a classifier with K outputs.
+        for i in range(len(self.num_children_per_parent)):
+            for j in range(x.size(0)): # Iterate over each sample in the batch                   
+                # We will make predictions for each value of K belonging to num_children_per_parent (e.g., [2,3,4,5]) 
+                child_logits[i][j] = self.child_classifiers[i][parent_class[j]](x[j])
         return parent_logits, child_logits
 
 
 class FinetuningModel(nn.Module):
-    def __init__(self, pretrained_model, drop_path, nb_classes, K=5):
+    def __init__(self, pretrained_model, drop_path, nb_classes, K=5, K_range = [2,3,4,5]):
         super(FinetuningModel, self).__init__()        
         self.pretrained_model = pretrained_model
         
