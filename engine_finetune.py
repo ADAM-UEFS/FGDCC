@@ -42,7 +42,7 @@ from src.utils.logging import (
     AverageMeter)
 from src.utils.tensors import repeat_interleave_batch
 from src.datasets.imagenet1k import make_imagenet1k
-from datasets.FineTuningDataset import make_FinetuningDataset
+from src.datasets.FineTuningDataset import make_FinetuningDataset
 
 from src.helper import (
     add_classification_head,

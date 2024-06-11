@@ -56,20 +56,42 @@ class KMeansModule:
         self.k = k
         self.d = dimensionality
         self.n_iter = n_iter
-        self.n_kmeans = [faiss.Kmeans(d=dimensionality, k=k, niter=1, gpu=True, verbose=True) for _ in nb_classes]         
+        self.n_kmeans = [faiss.Kmeans(d=dimensionality, k=k, niter=1, verbose=True, min_points_per_centroid = 1 ) for _ in range(nb_classes)]         
 
+    '''
+        Assigns a single data point to the set of clusters correspondent to the y target.
+        As faiss prevents us from assigning a single data point, this approach ensures 
+        the data meets the necessary size requirements and prevent us from
+        taking the risk of modifying the library's code. 
 
+    '''
     def assign(self, x, y):
         #D_batch = torch.empty()
         #I_batch = torch.empty()
+        print(x[0].size())
+        print(y.size())
+               
+        # Workaround to handle faiss centroid initialization.           
+        def augment(x): 
+            augmented_data = x.repeat((self.k, 1)) # add random noise?
+            return augmented_data 
+        
         for i in range(len(x)):
-            # Train K-means model for one iteration to initialize centroids
-            self.n_kmeans[y[i]].train(x[i])
-            # Assign vectors to the nearest cluster centroid
-            D, I = self.n_kmeans[y[i]].index.search(x[i], 1)
+            batch_x = x[i].unsqueeze(0) # Expand dims
 
-            D_batch = torch.cat((D_batch, D))
-            I_batch = torch.cat((I_batch, I))
+            # Create additional synthetic points to meet the minimum requirement for the number of clusters.             
+            augmented_data = augment(batch_x)
+            
+            # Train K-means model for one iteration to initialize centroids
+            self.n_kmeans[y[i]].train(augmented_data)
+
+            # Assign vectors to the nearest cluster centroid
+            D, I = self.n_kmeans[y[i]].index.search(batch_x, 1)            
+            print(D.size(), D[1])
+            print(I.size(), I[1])
+            #D_batch = torch.cat((D_batch, D))
+            #I_batch = torch.cat((I_batch, I))
+            
         return D_batch, I_batch
 
     def update(self, features):

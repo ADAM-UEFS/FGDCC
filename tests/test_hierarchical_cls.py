@@ -1,13 +1,11 @@
 import torch
 
-
 import sys
  
 # setting path
-sys.path.append('../../')
+sys.path.append('../')
 
 from src.helper import HierarchicalClassifier
-
 
 def main():
     batch_size = 64
