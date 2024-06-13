@@ -9,6 +9,18 @@ sys.path.append('../')
 from src.KMeans import KMeansModule
 
 
+# TODO (1): Adapt to handle a range of classes e.g., K=[2,3,4,5] and test.
+# (2) Build a test case to integrate to the hierarchical classification module.
+# (3) GPU testing?. 
+
+
+'''
+    TODO(s):
+        () - Setup the whole pipeline with classification module
+        () - Adapt k-means module to handle model selection
+        () - 
+        
+'''
 def main():
     batch_size = 64
     input_dim = 256
@@ -22,8 +34,10 @@ def main():
     print(y.size())
 
     D,I = kmeans.assign(x,y)
+    print(D)
+    print(I)
     print(D.size())
     print(I.size())
-    
+
 main()
 

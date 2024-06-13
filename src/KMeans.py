@@ -46,10 +46,6 @@ import faiss.contrib.torch_utils
 '''
 class KMeansModule:
 
-    # TODO (1): Adapt to handle a range of classes e.g., K=[2,3,4,5] and test.
-    # (2) Build a test case to integrate to the hierarchical classification module.
-    # (3) GPU testing?. 
-
     def __init__(self, nb_classes, dimensionality=256, n_iter=10, k=5, max_iter=300):
 
         # Create the K-means object
@@ -64,38 +60,14 @@ class KMeansModule:
         the data meets the necessary size requirements and prevent us from
         taking the risk of modifying the library's code. 
 
-        What is the problem within the assignment step?
-
-        The pipeline proposal works as following: 
-            (1) - ViT encoding (feature extraction)
-            (2) - Non-linear dimensionality reduction (Autoencoding)
-            (3) - Compute assignments to obtain the subclass labels 
-            (4) - Compute the autoencoder reconstruction loss 
-            (5) - Compute the classification losses. 
-
-        Considering this we have the following problem: 
-        In order to compute the cluster assignments we have to have the initialized centroids at first, that is because k-means generally uses the own data points
-        to provide the locations for the centroids. This is a problem because we need at least n >= k data points to initialize the centroids and our data comes 
-        in batches of size 32 < n < 128. 
+        The problem with the assignment step is that in order to compute the cluster assignments we have to have the initialized centroids at first, that is 
+        because k-means generally uses the own data points to provide the locations for the centroids. This is a problem because we need at least n >= k 
+        data points to initialize the centroids and our data comes in batches of size 32 < n < 128. 
 
         Centroid initialization is going to be a problem in the first epoch because we wouldn't have the features cached yet, after that we can use the previous epoch's
         cache to initialize the centroids appropriately. Despite that, initialization is a problem for the first epochs despite of everything. That's because we are 
         using the reduced dimension features provided by an autoencoder that is going to be simultaneously trained to reduce the dimensionality of the features 
         provided by a ViT encoder that haven't properly learned good features yet. Therefore in the first few epochs, the initialization is expected to be very poor.
-
-        Therefore the proposed solution is:
-
-        For a pair (x, y)
-
-            If first epoch do:
-                - If the corresponding centroids has been initialized do:
-                    - Compute the assignment and concatenate over the batch dimension.
-                - Else:
-                    - Initialize centroids from x with random perturbations. TODO: here we can compute the std for each dimension and draw a random amount of stds to multiply and add to each dimension. 
-            Else          
-                - Initialize the centroids for all the K-means from the features cached from the previous epoch.
-                
-            TODO: keep two caches in memory, for the current and last epochs.             
         
         Other than that we would still could have residual problems due to this initialization process.
         Because of that, another regularization mechanism that we could do to circumvent this is to reset the K-means
@@ -105,60 +77,45 @@ class KMeansModule:
 
         (1) - Replace emtpy centroids by non empty ones with a perturbation.
         (2) - Train K-means after every T epochs e.g., 2 or 3 (this gives the encoders some space to refine their features). 
-        (3) - Reset the K-means centroids after every N epochs. I
+        (3) - Reset the K-means centroids after every N epochs (couldn't be deterministic)
 
     '''
-    # TODO: 
-    # If first epoch:
-    #   If centroid is initialized just compute assignments.
-    #   If not initialized do initialization:
-    #       Compute the stds for each dimension, draw a random number to multiply the std with, replace.
-    # 
-    # PS: This have to be performed for each sample in the batch because it could be the case that a previous sample in the batch
-    # already happened to have been used to initialize the centroid. TODO: Attention.
-    #
-    # Receive as input a cache parameter (check if not empty). TODO: structure the cache dictionary. 
-    # Adjust the process to handle multiple K-means [2,3,4,5, ...]
-    def assign(self, x, y):
-        #D_batch = torch.empty()
-        #I_batch = torch.empty()
-        print(x[0].size())
-        print(y.size())
-
-        # replace empty centroid by a non empty one with a perturbation
-        #centroids[k] = centroids[m]
-        #for j in range(args.dim_pca):
-        #    sign = (j % 2) * 2 - 1;
-        #    centroids[k, j] += sign * 1e-7;
-        #    centroids[m, j] -= sign * 1e-7;
-
-               
-        # Workaround to handle faiss centroid initialization.           
-        def augment(x): 
-            augmented_data = x.repeat((self.k, 1)) # add random noise?
+    def assign(self, x, y, cached_features=None):
+        D_batch = []
+        I_batch = []        
+        # Workaround to handle faiss centroid initialization.
+        def augment(x, n_samples):
+            augmented_data = x.repeat((n_samples, 1))
+            for i in range((n_samples)):
+                sign = (torch.randint(0, 3, size=(self.d,)) - 1)                            
+                augmented_data[i] += sign * 1e-7                
             return augmented_data 
-        
+
         for i in range(len(x)):
             batch_x = x[i].unsqueeze(0) # Expand dims
+            # Initialize the centroids if it haven't been already initialized
+            if self.n_kmeans[y[i]].centroids is None:
+                # If first epoch, augment the datapoint then initialize
+                if cached_features is None:
+                    # Create additional synthetic points to meet the minimum requirement for the number of clusters.             
+                    batch_x = augment(batch_x, self.k)
+                else:
+                    # Otherwise use the features cached from the previous epoch
+                    batch_x = cached_features[y[i]]                
+                # Then train K-means model for one iteration to initialize centroids
+                self.n_kmeans[y[i]].train(batch_x)
+                    
+            # Assign the vectors to the nearest centroid
+            D, I = self.n_kmeans[y[i]].index.search(x[i].unsqueeze(0), 1)
+            D_batch.append(D[0])            
+            I_batch.append(I[0])            
+        D_batch = torch.stack((D_batch))
+        I_batch = torch.stack((I_batch))
 
-            # Create additional synthetic points to meet the minimum requirement for the number of clusters.             
-            augmented_data = augment(batch_x)
-            
-            # Train K-means model for one iteration to initialize centroids
-            self.n_kmeans[y[i]].train(augmented_data)
-
-            # Assign vectors to the nearest cluster centroid
-            D, I = self.n_kmeans[y[i]].index.search(batch_x, 1)            
-            print(D.size(), D[1])
-            print(I.size(), I[1])
-            #D_batch = torch.cat((D_batch, D))
-            #I_batch = torch.cat((I_batch, I))
-            
-        return D_batch, I_batch # FIXME.
+        return D_batch, I_batch
 
     def update(self, features):
         return 0
-
 
     # TODO: ensure that xb have been previously sent to a device 
     # What happens when we send a tensor to a device? []
