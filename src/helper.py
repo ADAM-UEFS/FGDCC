@@ -73,7 +73,7 @@ def load_checkpoint(
 
     return encoder, predictor, target_encoder, opt, scaler, epoch
 
-def load_FT_checkpoint(
+def load_DC_checkpoint(
     device,
     r_path,
     target_encoder,
@@ -430,9 +430,9 @@ def init_opt(
     scaler = torch.cuda.amp.GradScaler() if use_bfloat16 else None
     return optimizer, scaler, scheduler, wd_scheduler
 
-
-def init_FT_opt(
+def init_DC_opt(
     encoder,
+    autoencoder,
     iterations_per_epoch,
     start_lr,
     ref_lr,
@@ -464,6 +464,8 @@ def init_FT_opt(
 
     logger.info('Using AdamW')
     optimizer = torch.optim.AdamW(encoder.parameters())
+    AE_optimizer = torch.optim.AdamW(autoencoder.parameters())
+
     #optimizer = torch.optim.AdamW(param_groups)
     scheduler = WarmupCosineSchedule(
         optimizer,
@@ -478,4 +480,4 @@ def init_FT_opt(
         final_wd=final_wd,
         T_max=int(ipe_scale*num_epochs*iterations_per_epoch))
     scaler = NativeScalerWithGradNormCount() if use_bfloat16 else None
-    return optimizer, scaler, scheduler, wd_scheduler 
+    return optimizer, AE_optimizer, scaler, scheduler, wd_scheduler 

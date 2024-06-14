@@ -48,10 +48,11 @@ from datasets.FineTuningDataset import make_FinetuningDataset
 from src.helper import (
     add_classification_head,
     load_checkpoint,
-    load_FT_checkpoint,
+    load_DC_checkpoint,
     init_model,
     init_opt,
-    init_FT_opt
+    init_FT_opt,
+    init_DC_opt
     )
 from src.transforms import make_transforms
 import time
@@ -61,7 +62,7 @@ from timm.data.mixup import Mixup
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.utils import accuracy
 
-from src import KMeans 
+from src import KMeans
 
 # --
 log_timings = True
@@ -212,8 +213,6 @@ def main(args, resume_preempt=False):
         color_distortion=use_color_distortion,
         supervised=True,
         validation=False,
-        normalization=((0.436, 0.444, 0.330),
-                (0.203, 0.199, 0.195)), # PlantCLEF normalization
         color_jitter=color_jitter)
     
     val_transform = make_transforms( 
@@ -224,8 +223,6 @@ def main(args, resume_preempt=False):
         color_distortion=use_color_distortion,
         supervised=True,
         validation=True,
-        normalization=((0.436, 0.444, 0.330),
-                (0.203, 0.199, 0.195)), # PlantCLEF normalization
         color_jitter=color_jitter)
 
     # -- init data-loaders/samplers
@@ -287,7 +284,7 @@ def main(args, resume_preempt=False):
     if mixup_active:
         print("Mixup is activated!")
         mixup_fn = Mixup(mixup_alpha=mixup, cutmix_alpha=cutmix, label_smoothing=0.1, num_classes=nb_classes)
-
+        print("Warning: deactivate!")
     if mixup_fn is not None:
         # smoothing is handled with mixup label transform
         criterion = SoftTargetCrossEntropy()
@@ -337,8 +334,9 @@ def main(args, resume_preempt=False):
     target_encoder = add_classification_head(target_encoder, nb_classes=nb_classes, drop_path=drop_path, device=device)
 
     # -- Override previously loaded optimization configs.
-    optimizer, scaler, scheduler, wd_scheduler = init_FT_opt(
+    optimizer, AE_optimizer, scaler, scheduler, wd_scheduler = init_DC_opt(
         encoder=target_encoder,
+        autoencoder=autoencoder.module(),
         wd=wd,
         final_wd=final_wd,
         start_lr=start_lr,
@@ -352,8 +350,9 @@ def main(args, resume_preempt=False):
     
     target_encoder = DistributedDataParallel(target_encoder, static_graph=True) # Static Graph: the set of used and unused parameters will not change during the whole training loop.
     
+    # TODO: ADJUST THIS later
     if resume_epoch != 0:
-        target_encoder, optimizer, scaler, start_epoch = load_FT_checkpoint(
+        target_encoder, optimizer, scaler, start_epoch = load_DC_checkpoint(
             device=device,
             r_path=load_path,
             target_encoder=target_encoder,
@@ -373,7 +372,9 @@ def main(args, resume_preempt=False):
     start_epoch = resume_epoch
     
     K_range = [2,3,4,5]
-    k_means_module = KMeans(nb_classes, dimensionality=256, k=5)
+    k_means_module = KMeans.KMeansModule(nb_classes, dimensionality=256, k=5)
+
+    cached_features_last_iter = None
 
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
@@ -382,18 +383,22 @@ def main(args, resume_preempt=False):
 
         supervised_sampler_train.set_epoch(epoch) # Calling the set_epoch() method at the beginning of each epoch before creating the DataLoader iterator is necessary to make shuffling work properly across multiple epochs.
         
-        loss_meter = AverageMeter()
+        cls_loss_meter = AverageMeter()
+        parent_cls_loss_meter = AverageMeter()
+        children_cls_loss_meter = AverageMeter()
+        reconstruction_loss_meter = AverageMeter()
         time_meter = AverageMeter()
 
         target_encoder.train(True)
 
-        cached_features = torch.empty()
+        cached_features = {}
         for itr, (sample, target) in enumerate(supervised_loader_train):
             
             def load_imgs():
                 samples = sample.to(device, non_blocking=True)
                 targets = target.to(device, non_blocking=True)
-
+                
+                # TODO: Verify how to add mixup in this hierarchical setting.     
                 if mixup_fn is not None:
                     samples, targets = mixup_fn(samples, targets)
                 return (samples, targets)
@@ -423,7 +428,7 @@ def main(args, resume_preempt=False):
                     with torch.cuda.amp.autocast(enabled=False): 
                         # Outputs should be a list of items in the shape:
                         # [(batch_size), (batch_size, K)]: the distances to the nearest clusters, and the cluster assignments for each image in the batch, for each value of K within its range
-                        k_means_loss, k_means_assignments = k_means_module.assign(bottleneck_output, targets)  
+                        k_means_loss, k_means_assignments = k_means_module.assign(bottleneck_output, targets, cached_features_last_iter)  
                     
                     # Add K-means distances term as penalty to enforce a k-means friendly space 
                     reconstruction_loss += k_means_loss
@@ -435,51 +440,78 @@ def main(args, resume_preempt=False):
                     parent_logits, child_logits = target_encoder.hierarchical_classification(h)
 
                     loss = loss_fn(parent_logits, targets) # TODO: verify whether all reduce should be kept here or somewhere else
-                                        
+
                     # Model selection: Iterate through every K classifier computing the loss then select the one with smallest value 
                     subclass_loss = [loss_fn(child_logits[i], k_means_assignments[i]) for i in range(len(K_range))]                    
                     subclass_loss = subclass_loss[torch.argmin(torch.cat(subclass_loss), dim=0)]
-                    # 
+                    # TODO: Verify ABOVE
                     #####################################################################################################################
+
+                    # Update losses individually
+                    parent_cls_loss_meter.update(loss)
+                    children_cls_loss_meter.update(subclass_loss) 
+                    
+                    # Sum parent and subclass loss
                     loss += subclass_loss
                 
-                loss_value = loss.item()
-                reconstruction_loss_value = reconstruction_loss.item() # TODO: LOGGING[]
+                if accum_iter > 1:
+                    loss_value = loss.item()
+                    reconstruction_loss_value = reconstruction_loss.item()
 
-                loss /= accum_iter
-                reconstruction_loss /= accum_iter
+                    loss /= accum_iter
+                    reconstruction_loss /= accum_iter
+                else:
+                    loss_value = loss
+                    reconstruction_loss_value = reconstruction_loss 
+
                 #  Step 2. Backward & step
                 if use_bfloat16:
                     scaler(loss, optimizer, clip_grad=None,
                                 parameters=target_encoder.parameters(), create_graph=False,
                                 update_grad=(itr + 1) % accum_iter == 0) # Scaling is only necessary when using bfloat16.                    
                     
-                    # FIXME: build a different optimizer for the autoencoder model
-                    scaler(reconstruction_loss, optimizer, clip_grad=None,
+                    scaler(reconstruction_loss, AE_optimizer, clip_grad=1.0,
                                 parameters=autoencoder.parameters(), create_graph=False,
                                 update_grad=(itr + 1) % accum_iter == 0)
                 else:
                     loss.backward()
+                    reconstruction_loss.backward()
+                    
                     optimizer.step()
+                    AE_optimizer.step()
 
                 grad_stats = grad_logger(target_encoder.named_parameters())
+                
                 if (itr + 1) % accum_iter == 0:
                     optimizer.zero_grad()
+                    AE_optimizer.zero_grad()
 
-                # TODO: adjust return
-                return (float(loss_value), _new_lr, _new_wd, grad_stats, bottleneck_output)
+                return (loss_value, reconstruction_loss_value, _new_lr, _new_wd, grad_stats, bottleneck_output)
 
-            (loss, _new_lr, _new_wd, grad_stats, bottleneck_output), etime = gpu_timer(train_step)
+            (loss, reconstruction_loss, _new_lr, _new_wd, grad_stats, bottleneck_output), etime = gpu_timer(train_step)
             
             # TODO VERIFY: Guess that reduction should be applied below
-            cached_features = torch.cat((cached_features, [bottleneck_output.to(device=torch.device('cpu'), dtype=torch.float32), target]))
+            bottleneck_output.to(device=torch.device('cpu'), dtype=torch.float32)
+            target.to(device=torch.device('cpu'))
+            
+            ##################### TODO TEST #########################
+            # TODO: Modularize, speedup with parallel processing...
+            for i in range(target.size(0)):
+                y = target[i]
+                x = bottleneck_output[i]
+                if cached_features[y] is None:
+                    cached_features[y] = [(x,y)]
+                else:
+                    cached_features[y].append((x,y))
+            #########################################################
+            #cached_features = torch.cat((cached_features, [bottleneck_output.to(device=torch.device('cpu'), dtype=torch.float32), target]))
 
-            loss_meter.update(loss)
+            cls_loss_meter.update(loss)
             time_meter.update(etime)
 
             # -- Logging
             def log_stats():
-
+                # TODO: ADJUST LOGGING to accomodate new stats !!!
                 csv_logger.log(epoch + 1, itr, loss, etime)
                 if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
                     logger.info('[%d, %5d/%5d] train_loss: %.3f '
@@ -488,7 +520,7 @@ def main(args, resume_preempt=False):
                                 '(%.1f ms)'
 
                                 % (epoch + 1, itr, ipe,
-                                    loss_meter.avg,
+                                    cls_loss_meter.avg,
                                     _new_wd,
                                     _new_lr,
                                     torch.cuda.max_memory_allocated() / 1024.**2,
@@ -503,8 +535,10 @@ def main(args, resume_preempt=False):
                                         grad_stats.max))
             log_stats()
         
+        cached_features_last_iter = cached_features # TODO this won't work, we have to perform a formal copy.
+        
         # Perform M step on K-means module
-        k_means_module.update(cached_features)
+        k_means_module.update(cached_features) # TODO: implement
 
         testAcc1 = AverageMeter()
         testAcc5 = AverageMeter()
@@ -537,7 +571,7 @@ def main(args, resume_preempt=False):
         vtime = gpu_timer(evaluate)
         
         # -- Save Checkpoint after every epoch
-        logger.info('avg. train_loss %.3f' % loss_meter.avg)
+        logger.info('avg. train_loss %.3f' % cls_loss_meter.avg)
         logger.info('avg. test_loss %.3f avg. Accuracy@1 %.3f - avg. Accuracy@5 %.3f' % (test_loss.avg, testAcc1.avg, testAcc5.avg))
         save_checkpoint(epoch+1)
         assert not np.isnan(loss), 'loss is nan'

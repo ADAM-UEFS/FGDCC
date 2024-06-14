@@ -46,13 +46,21 @@ import faiss.contrib.torch_utils
 '''
 class KMeansModule:
 
-    def __init__(self, nb_classes, dimensionality=256, n_iter=10, k=5, max_iter=300):
+    # TODO: nb_classes has to be the class idx_map. 
+    # TODO: Verify what pytorch uses. 
+    def __init__(self, nb_classes, dimensionality=256, n_iter=10, k_range=[2,3,4,5], max_iter=300):
 
         # Create the K-means object
-        self.k = k
+        self.k_range = k_range
         self.d = dimensionality
         self.n_iter = n_iter
-        self.n_kmeans = [faiss.Kmeans(d=dimensionality, k=k, niter=1, verbose=True, min_points_per_centroid = 1 ) for _ in range(nb_classes)]         
+        if len(k_range) == 1:
+            self.n_kmeans = [faiss.Kmeans(d=dimensionality, k=k_range[0], niter=1, verbose=True, min_points_per_centroid = 1 ) for _ in range(nb_classes)]   
+        else:
+            self.n_kmeans = []   
+            # TODO: in a single line
+            for _ in range(nb_classes):
+                self.n_kmeans.append([faiss.Kmeans(d=dimensionality, k=k, niter=1, verbose=True, min_points_per_centroid = 1 ) for k in k_range])
 
     '''
         Assigns a single data point to the set of clusters correspondent to the y target.
@@ -83,7 +91,8 @@ class KMeansModule:
     def assign(self, x, y, cached_features=None):
         D_batch = []
         I_batch = []        
-        # Workaround to handle faiss centroid initialization.
+        # Workaround to handle faiss centroid initialization with a single sample.
+        # We built upon Mathilde Caron's idea of adding perturbations to the data, but we do it randomly instead.
         def augment(x, n_samples):
             augmented_data = x.repeat((n_samples, 1))
             for i in range((n_samples)):
@@ -92,19 +101,21 @@ class KMeansModule:
             return augmented_data 
 
         for i in range(len(x)):
-            batch_x = x[i].unsqueeze(0) # Expand dims
-            # Initialize the centroids if it haven't been already initialized
-            if self.n_kmeans[y[i]].centroids is None:
+            # Expand dims
+            batch_x = x[i].unsqueeze(0)
+            # Initialize the centroids if it haven't already been initialized
+            if self.n_kmeans[y[i]][0].centroids is None:
                 # If first epoch, augment the datapoint then initialize
                 if cached_features is None:
-                    # Create additional synthetic points to meet the minimum requirement for the number of clusters.             
-                    batch_x = augment(batch_x, self.k)
+                    batch_x = augment(batch_x, self.k) # Create additional synthetic points to meet the minimum requirement for the number of clusters.             
                 else:
-                    # Otherwise use the features cached from the previous epoch
-                    batch_x = cached_features[y[i]]                
+                    image_list = cached_features[y[i]] # Otherwise use the features cached from the previous epoch                
+                    batch_x = torch.stack(image_list)
                 # Then train K-means model for one iteration to initialize centroids
-                self.n_kmeans[y[i]].train(batch_x)
-                    
+                for k in range(self.k_range):
+                    self.n_kmeans[y[i]][k].train(batch_x)
+            
+            # TODO: ADJUST THE FORMATTING BELOW TO HANDLE MULTIPLE K.
             # Assign the vectors to the nearest centroid
             D, I = self.n_kmeans[y[i]].index.search(x[i].unsqueeze(0), 1)
             D_batch.append(D[0])            
@@ -114,7 +125,8 @@ class KMeansModule:
 
         return D_batch, I_batch
 
-    def update(self, features):
+
+    def update(self, cached_features):
         return 0
 
     # TODO: ensure that xb have been previously sent to a device 
