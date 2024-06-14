@@ -43,7 +43,7 @@ from src.utils.logging import (
 
 from src.utils.tensors import repeat_interleave_batch
 from src.datasets.imagenet1k import make_imagenet1k
-from datasets.FineTuningDataset import make_FinetuningDataset
+from src.datasets.FineTuningDataset import make_GenericDataset
 
 from src.helper import (
     add_classification_head,
@@ -51,7 +51,6 @@ from src.helper import (
     load_DC_checkpoint,
     init_model,
     init_opt,
-    init_FT_opt,
     init_DC_opt
     )
 from src.transforms import make_transforms
@@ -63,6 +62,7 @@ from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.utils import accuracy
 
 from src import KMeans
+import faiss
 
 # --
 log_timings = True
@@ -226,7 +226,7 @@ def main(args, resume_preempt=False):
         color_jitter=color_jitter)
 
     # -- init data-loaders/samplers
-    _, supervised_loader_train, supervised_sampler_train = make_FinetuningDataset(
+    _, supervised_loader_train, supervised_sampler_train = make_GenericDataset(
             transform=training_transform,
             batch_size=batch_size,
             collator=None,
@@ -245,7 +245,7 @@ def main(args, resume_preempt=False):
     # Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. 
     # This will slightly alter validation results as extra duplicate entries are added to achieve
     # equal num of samples per-process.'
-    _, supervised_loader_val, supervised_sampler_val = make_FinetuningDataset(
+    _, supervised_loader_val, supervised_sampler_val = make_GenericDataset(
             transform=val_transform,
             batch_size=batch_size,
             collator= None,
@@ -336,7 +336,7 @@ def main(args, resume_preempt=False):
     # -- Override previously loaded optimization configs.
     optimizer, AE_optimizer, scaler, scheduler, wd_scheduler = init_DC_opt(
         encoder=target_encoder,
-        autoencoder=autoencoder.module(),
+        autoencoder=autoencoder,
         wd=wd,
         final_wd=final_wd,
         start_lr=start_lr,
@@ -350,7 +350,7 @@ def main(args, resume_preempt=False):
     
     target_encoder = DistributedDataParallel(target_encoder, static_graph=True) # Static Graph: the set of used and unused parameters will not change during the whole training loop.
     
-    # TODO: ADJUST THIS later
+    # TODO: ADJUST THIS later!
     if resume_epoch != 0:
         target_encoder, optimizer, scaler, start_epoch = load_DC_checkpoint(
             device=device,
@@ -371,8 +371,13 @@ def main(args, resume_preempt=False):
     accum_iter = 1
     start_epoch = resume_epoch
     
+    res = faiss.StandardGpuResources()
+    cfg = faiss.GpuIndexFlatConfig()
+    cfg.device = rank
+
+
     K_range = [2,3,4,5]
-    k_means_module = KMeans.KMeansModule(nb_classes, dimensionality=256, k=5)
+    k_means_module = KMeans.KMeansModule(nb_classes, dimensionality=256, k_range=K_range, resources=res, config=cfg)
 
     cached_features_last_iter = None
 
@@ -419,17 +424,21 @@ def main(args, resume_preempt=False):
 
                     # Step 1. Forward into the encoder
                     h = target_encoder(imgs) 
-                    
+
                     # Step 2. Autoencoder Dimensionality Reduction  
-                    reconstructed_input, bottleneck_output = autoencoder(h) 
-                    reconstruction_loss = F.smooth_l1_loss(reconstructed_input, h) # TODO: verify whether does activation has to be performed in the features or not.
-                    
+                    reconstructed_input, bottleneck_output = autoencoder(h)                     
+
+                    reconstruction_loss = F.smooth_l1_loss(reconstructed_input, h)
+
                     # Step 3. Compute K-Means assignments with disabled autocast as faiss requires float32
                     with torch.cuda.amp.autocast(enabled=False): 
-                        # Outputs should be a list of items in the shape:
-                        # [(batch_size), (batch_size, K)]: the distances to the nearest clusters, and the cluster assignments for each image in the batch, for each value of K within its range
-                        k_means_loss, k_means_assignments = k_means_module.assign(bottleneck_output, targets, cached_features_last_iter)  
-                    
+                        ''' Outputs should be a list of items in the shape:
+                            [(batch_size, len(k_range), 1), (batch_size, len(k_range), 1)]
+                            That is, the distances to the nearest clusters
+                            and the cluster assignments for each image in the batch, for each value of K within its range
+                        '''
+                        k_means_loss, k_means_assignments = k_means_module.assign(bottleneck_output, targets, device, cached_features_last_iter)  
+                        
                     # Add K-means distances term as penalty to enforce a k-means friendly space 
                     reconstruction_loss += k_means_loss
 

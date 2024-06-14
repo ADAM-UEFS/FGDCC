@@ -48,19 +48,31 @@ class KMeansModule:
 
     # TODO: nb_classes has to be the class idx_map. 
     # TODO: Verify what pytorch uses. 
-    def __init__(self, nb_classes, dimensionality=256, n_iter=10, k_range=[2,3,4,5], max_iter=300):
+    def __init__(self, nb_classes, dimensionality=256, n_iter=10, k_range=[2,3,4,5], resources=None, config=None, max_iter=300):
+
+        self.resources = resources
+        self.config = config        
+        self.index = faiss.GpuIndexFlatL2(resources, dimensionality, config)
+
+        # TODO: apply below
+        # index.reset() should clear out the contents but keep any learned parameters that it was trained on.
 
         # Create the K-means object
         self.k_range = k_range
         self.d = dimensionality
         self.n_iter = n_iter
+        
         if len(k_range) == 1:
             self.n_kmeans = [faiss.Kmeans(d=dimensionality, k=k_range[0], niter=1, verbose=True, min_points_per_centroid = 1 ) for _ in range(nb_classes)]   
         else:
             self.n_kmeans = []   
             # TODO: in a single line
             for _ in range(nb_classes):
-                self.n_kmeans.append([faiss.Kmeans(d=dimensionality, k=k, niter=1, verbose=True, min_points_per_centroid = 1 ) for k in k_range])
+                self.n_kmeans.append([faiss.Kmeans(d=dimensionality, k=k, niter=1, verbose=True, min_points_per_centroid = 1) for k in k_range])
+            
+            for cls in range(nb_classes):
+                for k in range(len(k_range)):
+                    self.n_kmeans[cls][k].index = self.index
 
     '''
         Assigns a single data point to the set of clusters correspondent to the y target.
@@ -88,7 +100,7 @@ class KMeansModule:
         (3) - Reset the K-means centroids after every N epochs (couldn't be deterministic)
 
     '''
-    def assign(self, x, y, cached_features=None):
+    def assign(self, x, y, device, cached_features=None):
         D_batch = []
         I_batch = []        
         # Workaround to handle faiss centroid initialization with a single sample.
@@ -96,8 +108,10 @@ class KMeansModule:
         def augment(x, n_samples):
             augmented_data = x.repeat((n_samples, 1))
             for i in range((n_samples)):
-                sign = (torch.randint(0, 3, size=(self.d,)) - 1)                            
-                augmented_data[i] += sign * 1e-7                
+                sign = (torch.randint(0, 3, size=(self.d,)) - 1)
+                sign = sign.to(device=device, dtype=torch.float32)
+                eps = torch.tensor(1e-7, dtype=torch.float32, device=device)    
+                augmented_data[i] += sign * eps                
             return augmented_data 
 
         for i in range(len(x)):
@@ -107,22 +121,24 @@ class KMeansModule:
             if self.n_kmeans[y[i]][0].centroids is None:
                 # If first epoch, augment the datapoint then initialize
                 if cached_features is None:
-                    batch_x = augment(batch_x, self.k) # Create additional synthetic points to meet the minimum requirement for the number of clusters.             
+                    batch_x = augment(batch_x, self.k_range[len(self.k_range)-1]) # Create additional synthetic points to meet the minimum requirement for the number of clusters.             
                 else:
                     image_list = cached_features[y[i]] # Otherwise use the features cached from the previous epoch                
                     batch_x = torch.stack(image_list)
                 # Then train K-means model for one iteration to initialize centroids
-                for k in range(self.k_range):
+                for k in range(len(self.k_range)):
                     self.n_kmeans[y[i]][k].train(batch_x)
             
-            # TODO: ADJUST THE FORMATTING BELOW TO HANDLE MULTIPLE K.
             # Assign the vectors to the nearest centroid
-            D, I = self.n_kmeans[y[i]].index.search(x[i].unsqueeze(0), 1)
-            D_batch.append(D[0])            
-            I_batch.append(I[0])            
+            D_k, I_k = [], []
+            for k in range(len(self.k_range)):
+                D, I = self.n_kmeans[y[i]][k].index.search(x[i].unsqueeze(0), 1)
+                D_k.append(D[0])
+                I_k.append(I[0])            
+            D_batch.append(torch.stack(D_k))
+            I_batch.append(torch.stack(I_k))
         D_batch = torch.stack((D_batch))
         I_batch = torch.stack((I_batch))
-
         return D_batch, I_batch
 
 

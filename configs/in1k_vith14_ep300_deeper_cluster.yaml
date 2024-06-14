@@ -6,12 +6,12 @@ data:
   - 1.0
   crop_size: 224
   drop_path: 0.25
-  mixup: 0.8
+  mixup: 0.0 #0.8
   nb_classes: 1081
-  cutmix: 1.0
+  cutmix: 0.0 #1.0
   reprob: 0.25
-  image_folder:  PlantNet300k/
-  num_workers: 64
+  image_folder:  /home/rtcalumby/adam/luciano/plantnet_300K/
+  num_workers: 10
   pin_mem: true
   root_path: /home/rtcalumby/adam/luciano/
   use_color_distortion: false
@@ -52,7 +52,7 @@ optimization:
   final_lr: 1.0e-06 # Default: 1e-6
   final_weight_decay: 0.4  
   ipe_scale: 1.0
-  lr: 1.0e-03 #0.0007 # Default 0.0015 -> lr = base lr × batchsize / 256. (learning rate formula). /0.0007
+  lr: 1.0e-04 #0.0007 # Default 0.0015 -> lr = base lr × batchsize / 256. (learning rate formula). /0.0007
   start_lr: 1.0e-04 #0.00001 # Default: 0.0002 
   warmup: 10
   weight_decay: 0.05
