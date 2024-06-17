@@ -374,7 +374,8 @@ def main(args, resume_preempt=False):
     res = faiss.StandardGpuResources()
     cfg = faiss.GpuIndexFlatConfig()
     cfg.device = rank
-
+    # TODO: check where to apply the following: 
+    # index.reset() should clear out the contents but keep any learned parameters that it was trained on.
 
     K_range = [2,3,4,5]
     k_means_module = KMeans.KMeansModule(nb_classes, dimensionality=256, k_range=K_range, resources=res, config=cfg)
@@ -439,7 +440,7 @@ def main(args, resume_preempt=False):
                         '''
                         k_means_loss, k_means_assignments = k_means_module.assign(bottleneck_output, targets, device, cached_features_last_iter)  
                         
-                    # Add K-means distances term as penalty to enforce a k-means friendly space 
+                    # Add K-means distances term as penalty to enforce a "k-means friendly space" 
                     reconstruction_loss += k_means_loss
 
                     # TODO (1) TEST THIS SECTION, integrate with K-means module.
@@ -516,6 +517,7 @@ def main(args, resume_preempt=False):
             #cached_features = torch.cat((cached_features, [bottleneck_output.to(device=torch.device('cpu'), dtype=torch.float32), target]))
 
             cls_loss_meter.update(loss)
+            reconstruction_loss_meter.update(reconstruction_loss)
             time_meter.update(etime)
 
             # -- Logging

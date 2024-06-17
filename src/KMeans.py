@@ -52,10 +52,9 @@ class KMeansModule:
 
         self.resources = resources
         self.config = config        
-        self.index = faiss.GpuIndexFlatL2(resources, dimensionality, config)
 
         # TODO: apply below
-        # index.reset() should clear out the contents but keep any learned parameters that it was trained on.
+        
 
         # Create the K-means object
         self.k_range = k_range
@@ -72,8 +71,14 @@ class KMeansModule:
             
             for cls in range(nb_classes):
                 for k in range(len(k_range)):
-                    self.n_kmeans[cls][k].index = self.index
+                    self.n_kmeans[cls][k].setIndex_(faiss.GpuIndexFlatL2(self.resources, self.d, self.config))
+            
+        print(self.n_kmeans[0][0].index.getResources())
+        print(self.n_kmeans[0][0].index.getDevice())
+        print(self.n_kmeans[0][0].index.setDevice())
+        
 
+        
     '''
         Assigns a single data point to the set of clusters correspondent to the y target.
         As faiss prevents us from assigning a single data point, this approach ensures 
