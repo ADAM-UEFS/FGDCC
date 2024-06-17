@@ -46,7 +46,8 @@ from src.datasets.imagenet1k import make_imagenet1k
 from src.datasets.FineTuningDataset import make_GenericDataset
 
 from src.helper import (
-    add_classification_head,
+    configure_finetuning,
+    get_classification_head,
     load_checkpoint,
     load_DC_checkpoint,
     init_model,
@@ -331,11 +332,14 @@ def main(args, resume_preempt=False):
     for p in target_encoder.parameters():
         p.requires_grad = True
 
-    target_encoder = add_classification_head(target_encoder, nb_classes=nb_classes, drop_path=drop_path, device=device)
-
+    target_encoder = configure_finetuning(target_encoder, nb_classes=nb_classes, drop_path=drop_path, device=device)
+    hierarchical_classifier = get_classification_head(target_encoder.pretrained_model.embed_dim, nb_classes=nb_classes, drop_path=drop_path, K_range=[2,3,4,5] ,device=device)
+    
     # -- Override previously loaded optimization configs.
+    # Create one optimizer that takes into account both encoder and its classifier parameters.
     optimizer, AE_optimizer, scaler, scheduler, wd_scheduler = init_DC_opt(
         encoder=target_encoder,
+        classifier=hierarchical_classifier,
         autoencoder=autoencoder,
         wd=wd,
         final_wd=final_wd,
@@ -349,6 +353,7 @@ def main(args, resume_preempt=False):
         use_bfloat16=use_bfloat16)
     
     target_encoder = DistributedDataParallel(target_encoder, static_graph=True) # Static Graph: the set of used and unused parameters will not change during the whole training loop.
+    hierarchical_classifier = DistributedDataParallel(hierarchical_classifier, static_graph=True) # Static Graph: the set of used and unused parameters will not change during the whole training loop.
     
     # TODO: ADJUST THIS later!
     if resume_epoch != 0:
@@ -371,12 +376,13 @@ def main(args, resume_preempt=False):
     accum_iter = 1
     start_epoch = resume_epoch
     
+    #resources = [faiss.StandardGpuResources() for i in range(world_size)]
     res = faiss.StandardGpuResources()
     cfg = faiss.GpuIndexFlatConfig()
     cfg.device = rank
+    
     # TODO: check where to apply the following: 
     # index.reset() should clear out the contents but keep any learned parameters that it was trained on.
-
     K_range = [2,3,4,5]
     k_means_module = KMeans.KMeansModule(nb_classes, dimensionality=256, k_range=K_range, resources=res, config=cfg)
 
@@ -438,24 +444,46 @@ def main(args, resume_preempt=False):
                             That is, the distances to the nearest clusters
                             and the cluster assignments for each image in the batch, for each value of K within its range
                         '''
-                        k_means_loss, k_means_assignments = k_means_module.assign(bottleneck_output, targets, device, cached_features_last_iter)  
-                        
-                    # Add K-means distances term as penalty to enforce a "k-means friendly space" 
-                    reconstruction_loss += k_means_loss
+                        k_means_loss, k_means_assignments = k_means_module.assign(x=bottleneck_output, y=targets, resources=res, rank=rank, device=device, cached_features=cached_features_last_iter)  
 
-                    # TODO (1) TEST THIS SECTION, integrate with K-means module.
+                    k_means_loss = k_means_loss.to(device)
                     #####################################################################################################################
                     #
                     # Step 4. Hierarchical Classification
-                    parent_logits, child_logits = target_encoder.hierarchical_classification(h)
+                    parent_logits, child_logits = hierarchical_classifier(h) # FIXME: child logits are being returned on CPU !!! 
+
+                    print('hierachical classification - done')
 
                     loss = loss_fn(parent_logits, targets) # TODO: verify whether all reduce should be kept here or somewhere else
+                    print('parent loss - done')
+
+                    print('child LOGITS,', child_logits)
+
+                    '''
+                        TODO(s):
+                            (1) - Check the label format of the target tensors and see if it the k_means assignments matches.
+                            (2) - Send the tensors above to the proper device. FIXME verify why child logits are in cpu instead of cuda:0
+                            (3) - Find the index of the best K and gather the corresponding losses for that i.e., k_means_loss[:, "best_k", 0]
+                            then (print to see if are scalars), and verify whether we should add its average or its sum.                            
+                    '''
 
                     # Model selection: Iterate through every K classifier computing the loss then select the one with smallest value 
-                    subclass_loss = [loss_fn(child_logits[i], k_means_assignments[i]) for i in range(len(K_range))]                    
+                    subclass_loss = [loss_fn(child_logits[i].to(device), k_means_assignments[i]) for i in range(len(K_range))]                    
+
+                    print(subclass_loss.size())
+
                     subclass_loss = subclass_loss[torch.argmin(torch.cat(subclass_loss), dim=0)]
-                    # TODO: Verify ABOVE
+                    
+                    # TODO: Verify if ABOVE works
                     #####################################################################################################################
+
+                    # TODO: 
+                    # Here we have to gather the losses corresponding to the K that achieved the smallest loss  
+                    # say K=4 yielded the smallest loss then: 
+
+                    # Add K-means distances term as penalty to enforce a "k-means friendly space" 
+                    reconstruction_loss += (0.25 * k_means_loss) 
+
 
                     # Update losses individually
                     parent_cls_loss_meter.update(loss)
@@ -477,7 +505,7 @@ def main(args, resume_preempt=False):
                 #  Step 2. Backward & step
                 if use_bfloat16:
                     scaler(loss, optimizer, clip_grad=None,
-                                parameters=target_encoder.parameters(), create_graph=False,
+                                parameters=(list(target_encoder.parameters())+ list(hierarchical_classifier.parameters())), create_graph=False,
                                 update_grad=(itr + 1) % accum_iter == 0) # Scaling is only necessary when using bfloat16.                    
                     
                     scaler(reconstruction_loss, AE_optimizer, clip_grad=1.0,

@@ -52,10 +52,7 @@ class KMeansModule:
 
         self.resources = resources
         self.config = config        
-
-        # TODO: apply below
         
-
         # Create the K-means object
         self.k_range = k_range
         self.d = dimensionality
@@ -65,18 +62,16 @@ class KMeansModule:
             self.n_kmeans = [faiss.Kmeans(d=dimensionality, k=k_range[0], niter=1, verbose=True, min_points_per_centroid = 1 ) for _ in range(nb_classes)]   
         else:
             self.n_kmeans = []   
-            # TODO: in a single line
             for _ in range(nb_classes):
                 self.n_kmeans.append([faiss.Kmeans(d=dimensionality, k=k, niter=1, verbose=True, min_points_per_centroid = 1) for k in k_range])
             
-            for cls in range(nb_classes):
-                for k in range(len(k_range)):
-                    self.n_kmeans[cls][k].setIndex_(faiss.GpuIndexFlatL2(self.resources, self.d, self.config))
-            
-        print(self.n_kmeans[0][0].index.getResources())
-        print(self.n_kmeans[0][0].index.getDevice())
-        print(self.n_kmeans[0][0].index.setDevice())
-        
+#            for cls in range(nb_classes):
+#                for k in range(len(k_range)):
+                    #faiss.GpuIndexFlatL2(self.resources, self.d, self.config)
+#                    index_flat = self.n_kmeans[cls][k].index
+#                    gpu_index_flat = faiss.index_cpu_to_gpu(resources, config.device, index_flat)
+#                    self.n_kmeans[cls][k].index = gpu_index_flat
+                                                            
 
         
     '''
@@ -105,35 +100,41 @@ class KMeansModule:
         (3) - Reset the K-means centroids after every N epochs (couldn't be deterministic)
 
     '''
-    def assign(self, x, y, device, cached_features=None):
-        D_batch = []
-        I_batch = []        
-        # Workaround to handle faiss centroid initialization with a single sample.
-        # We built upon Mathilde Caron's idea of adding perturbations to the data, but we do it randomly instead.
+    def assign(self, x, y, resources, rank, device, cached_features=None):
+
         def augment(x, n_samples):
+            # Workaround to handle faiss centroid initialization with a single sample.
+            # We built upon Mathilde Caron's idea of adding perturbations to the data, but we do it randomly instead.
             augmented_data = x.repeat((n_samples, 1))
             for i in range((n_samples)):
                 sign = (torch.randint(0, 3, size=(self.d,)) - 1)
                 sign = sign.to(device=device, dtype=torch.float32)
-                eps = torch.tensor(1e-7, dtype=torch.float32, device=device)    
+                eps = torch.tensor(1e-7, dtype=torch.float32, device=device)   
                 augmented_data[i] += sign * eps                
             return augmented_data 
 
+        def initialize_centroids(batch_x, class_id):
+            # If first epoch, augment the datapoint then initialize
+            if cached_features is None:
+                batch_x = augment(batch_x, self.k_range[len(self.k_range)-1]) # Create additional synthetic points to meet the minimum requirement for the number of clusters.             
+            else:
+                image_list = cached_features[class_id] # Otherwise use the features cached from the previous epoch                
+                batch_x = torch.stack(image_list)
+            for k in range(len(self.k_range)):
+                self.n_kmeans[class_id][k].train(batch_x.detach().cpu()) # Then train K-means model for one iteration to initialize centroids
+                # Replace the regular index by a gpu one
+                index_flat = self.n_kmeans[class_id][k].index
+                gpu_index_flat = faiss.index_cpu_to_gpu(resources, rank, index_flat)
+                self.n_kmeans[class_id][k].index = gpu_index_flat
+
+        D_batch = []
+        I_batch = []        
         for i in range(len(x)):
             # Expand dims
             batch_x = x[i].unsqueeze(0)
             # Initialize the centroids if it haven't already been initialized
             if self.n_kmeans[y[i]][0].centroids is None:
-                # If first epoch, augment the datapoint then initialize
-                if cached_features is None:
-                    batch_x = augment(batch_x, self.k_range[len(self.k_range)-1]) # Create additional synthetic points to meet the minimum requirement for the number of clusters.             
-                else:
-                    image_list = cached_features[y[i]] # Otherwise use the features cached from the previous epoch                
-                    batch_x = torch.stack(image_list)
-                # Then train K-means model for one iteration to initialize centroids
-                for k in range(len(self.k_range)):
-                    self.n_kmeans[y[i]][k].train(batch_x)
-            
+                initialize_centroids(batch_x, y[i])
             # Assign the vectors to the nearest centroid
             D_k, I_k = [], []
             for k in range(len(self.k_range)):

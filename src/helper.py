@@ -151,8 +151,9 @@ class ChildClassifier(nn.Module):
 
 '''
 class HierarchicalClassifier(nn.Module):
-    def __init__(self, input_dim, num_parents, num_children_per_parent):
+    def __init__(self, input_dim, num_parents, drop_path, num_children_per_parent):
         super(HierarchicalClassifier, self).__init__()
+        self.head_drop = nn.Dropout(drop_path)
         self.num_parents = num_parents
         self.num_children_per_parent = num_children_per_parent
         self.parent_classifier = ParentClassifier(input_dim, num_parents)
@@ -163,6 +164,7 @@ class HierarchicalClassifier(nn.Module):
         )
 
     def forward(self, x):
+        x = self.head_drop(x)
         parent_logits = self.parent_classifier(x)  # Shape (batch_size, num_parents)
         parent_probs = F.softmax(parent_logits, dim=1)  # Softmax over class dimension
 
@@ -191,10 +193,6 @@ class FinetuningModel(nn.Module):
         
         self.head_drop = nn.Dropout(drop_path)
 
-        self.hierarchical_classifier = HierarchicalClassifier(input_dim=self.pretrained_model.embed_dim,
-                                                              num_parents=self.nb_classes,
-                                                              num_children_per_parent=K_range)
-
     '''
         Returns normalized features only.
     '''
@@ -208,13 +206,6 @@ class FinetuningModel(nn.Module):
 
         return x
     
-    def hierarchical_classification(self, x):
-        x = self.head_drop(x)
-        
-        parent_logits, child_logits = self.hierarchical_classifier(x)
-
-        return parent_logits, child_logits
-
     '''
     # Another Idea:
      I guess that another possibility of doing classification hierarchically 
@@ -282,10 +273,19 @@ class FinetuningModel(nn.Module):
         return x
 
     
-def add_classification_head(pretrained_model, drop_path, nb_classes, device):
+def configure_finetuning(pretrained_model, drop_path, nb_classes, device):
     model = FinetuningModel(pretrained_model, drop_path, nb_classes)    
     model.to(device)
     return model         
+
+def get_classification_head(embed_dim, drop_path, nb_classes, K_range, device):
+    model = HierarchicalClassifier(input_dim=embed_dim,
+                                   num_parents=nb_classes,
+                                   drop_path=drop_path,
+                                   num_children_per_parent=K_range)        
+    model.to(device)
+    return model         
+
         
 
 # Borrowed from MAE.
@@ -432,6 +432,7 @@ def init_opt(
 
 def init_DC_opt(
     encoder,
+    classifier,
     autoencoder,
     iterations_per_epoch,
     start_lr,
@@ -463,7 +464,7 @@ def init_DC_opt(
     #)
 
     logger.info('Using AdamW')
-    optimizer = torch.optim.AdamW(encoder.parameters())
+    optimizer = torch.optim.AdamW(list(encoder.parameters()) + list(classifier.parameters()))
     AE_optimizer = torch.optim.AdamW(autoencoder.parameters())
 
     #optimizer = torch.optim.AdamW(param_groups)
