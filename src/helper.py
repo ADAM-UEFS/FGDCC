@@ -163,7 +163,7 @@ class HierarchicalClassifier(nn.Module):
             ) for num_children in num_children_per_parent]    
         )
 
-    def forward(self, x):
+    def forward(self, x, device):
         x = self.head_drop(x)
         parent_logits = self.parent_classifier(x)  # Shape (batch_size, num_parents)
         parent_probs = F.softmax(parent_logits, dim=1)  # Softmax over class dimension
@@ -172,7 +172,7 @@ class HierarchicalClassifier(nn.Module):
         parent_class = torch.argmax(parent_probs, dim=1)  # Argmax over class dimension: Shape (batch_size)
 
         # Use the predicted parent class to select the corresponding child classifier
-        child_logits = [torch.zeros(x.size(0), num) for num in self.num_children_per_parent] # Each element within child_logits is associated to a classifier with K outputs.
+        child_logits = [torch.zeros(x.size(0), num, device=device) for num in self.num_children_per_parent] # Each element within child_logits is associated to a classifier with K outputs.
         for i in range(len(self.num_children_per_parent)):
             for j in range(x.size(0)): # Iterate over each sample in the batch                   
                 # We will make predictions for each value of K belonging to num_children_per_parent (e.g., [2,3,4,5]) 
@@ -376,8 +376,22 @@ def init_model(
     encoder.to(device)
     predictor.to(device)
     
-    #logger.info(autoencoder)
     return encoder, predictor, autoencoder
+
+
+def build_cache(data_loader, device, target_encoder, autoencoder):
+    for itr, (sample, target) in enumerate(data_loader):    
+        def load_imgs():
+            samples = sample.to(device, non_blocking=True)
+            targets = target.to(device, non_blocking=True)
+            return (samples, targets)
+        imgs, targets = load_imgs()            
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):            
+            h = target_encoder(imgs)
+            reconstructed_input, bottleneck_output = autoencoder(h)
+
+    return 0
+
 
 def init_opt(
     encoder,
@@ -457,17 +471,10 @@ def init_DC_opt(
         }
     ]
 
-    # build optimizer with layer-wise lr decay (lrd)
-    #param_groups = lrd.param_groups_lrd(encoder.pretrained_model, wd,
-    #    no_weight_decay_list={'pos_embed', 'cls_token', 'dist_token'}, # decay list gathered here https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py#L573
-    #    layer_decay=0.75
-    #)
-
     logger.info('Using AdamW')
     optimizer = torch.optim.AdamW(list(encoder.parameters()) + list(classifier.parameters()))
     AE_optimizer = torch.optim.AdamW(autoencoder.parameters())
 
-    #optimizer = torch.optim.AdamW(param_groups)
     scheduler = WarmupCosineSchedule(
         optimizer,
         warmup_steps=int(warmup*iterations_per_epoch),

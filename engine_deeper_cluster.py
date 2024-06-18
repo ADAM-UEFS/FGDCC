@@ -386,8 +386,8 @@ def main(args, resume_preempt=False):
     K_range = [2,3,4,5]
     k_means_module = KMeans.KMeansModule(nb_classes, dimensionality=256, k_range=K_range, resources=res, config=cfg)
 
-    cached_features_last_iter = None
-
+    cached_features_last_epoch = None
+    cached_features = {}
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
         
@@ -403,7 +403,7 @@ def main(args, resume_preempt=False):
 
         target_encoder.train(True)
 
-        cached_features = {}
+        
         for itr, (sample, target) in enumerate(supervised_loader_train):
             
             def load_imgs():
@@ -444,20 +444,23 @@ def main(args, resume_preempt=False):
                             That is, the distances to the nearest clusters
                             and the cluster assignments for each image in the batch, for each value of K within its range
                         '''
-                        k_means_loss, k_means_assignments = k_means_module.assign(x=bottleneck_output, y=targets, resources=res, rank=rank, device=device, cached_features=cached_features_last_iter)  
+                        k_means_losses, k_means_assignments = k_means_module.assign(x=bottleneck_output, y=targets, resources=res, rank=rank, device=device, cached_features=cached_features_last_epoch)  
 
-                    k_means_loss = k_means_loss.to(device)
-                    #####################################################################################################################
-                    #
+                    #k_means_loss = k_means_loss.to(device) TODO: VERIFY IF NECESSARY
+                    print('Targets format:', target.size())
+                    print('Assignments format', k_means_assignments.size()) 
+
                     # Step 4. Hierarchical Classification
-                    parent_logits, child_logits = hierarchical_classifier(h) # FIXME: child logits are being returned on CPU !!! 
+                    parent_logits, child_logits = hierarchical_classifier(h, device)
 
-                    print('hierachical classification - done')
+                    loss = loss_fn(parent_logits, targets) # TODO: verify whether all reduce should be kept within the lossfn or somewhere else
 
-                    loss = loss_fn(parent_logits, targets) # TODO: verify whether all reduce should be kept here or somewhere else
-                    print('parent loss - done')
+                    print('Parent Logits info', parent_logits.size())
 
-                    print('child LOGITS,', child_logits)
+                    print('child logits info:')
+                    print('Length:', len(child_logits))
+                    print('Size @0:', child_logits[0].size())
+                    
 
                     '''
                         TODO(s):
@@ -466,24 +469,30 @@ def main(args, resume_preempt=False):
                             (3) - Find the index of the best K and gather the corresponding losses for that i.e., k_means_loss[:, "best_k", 0]
                             then (print to see if are scalars), and verify whether we should add its average or its sum.                            
                     '''
+                    # TODO review: I guess that the way this is implemented below is allowing to find the best K across the batch
+                    # whereas we should find the best K across each data point, otherwise we could gather the mean of all losses
+                    # instead.
 
                     # Model selection: Iterate through every K classifier computing the loss then select the one with smallest value 
-                    subclass_loss = [loss_fn(child_logits[i].to(device), k_means_assignments[i]) for i in range(len(K_range))]                    
+                    #subclass_loss = [loss_fn(child_logits[i].to(device), k_means_assignments[i]) for i in range(len(K_range))]   
+                    subclass_losses = []
+                    for k in range(len(K_range)):
+                        k_means_target = k_means_assignments[:,k,:]
+                        k_means_target = k_means_target.squeeze(1)
+                        subclass_loss = loss_fn(child_logits[k], k_means_target)
+                        subclass_losses.append(subclass_loss)
 
-                    print(subclass_loss.size())
-
-                    subclass_loss = subclass_loss[torch.argmin(torch.cat(subclass_loss), dim=0)]
+                    subclass_losses = torch.stack(subclass_losses)
                     
-                    # TODO: Verify if ABOVE works
-                    #####################################################################################################################
-
-                    # TODO: 
-                    # Here we have to gather the losses corresponding to the K that achieved the smallest loss  
-                    # say K=4 yielded the smallest loss then: 
+                    best_k_index = torch.argmin(subclass_losses)
+                    k_means_loss = k_means_losses[:, best_k_index, :]
+                    print('K-Means losses shape:', k_means_losses.size())
+                    print('K-Means (best-k) loss shape:', k_means_loss.size())
+                    print('K-Means (best-k) loss shape:', k_means_loss.squeeze(1).size())
+                    print('K-means best-k loss avg', )
 
                     # Add K-means distances term as penalty to enforce a "k-means friendly space" 
-                    reconstruction_loss += (0.25 * k_means_loss) 
-
+                    reconstruction_loss += (0.25 * torch.mean(k_means_loss)) 
 
                     # Update losses individually
                     parent_cls_loss_meter.update(loss)

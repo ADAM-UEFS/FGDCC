@@ -114,7 +114,6 @@ class KMeansModule:
             return augmented_data 
 
         def initialize_centroids(batch_x, class_id):
-            # If first epoch, augment the datapoint then initialize
             if cached_features is None:
                 batch_x = augment(batch_x, self.k_range[len(self.k_range)-1]) # Create additional synthetic points to meet the minimum requirement for the number of clusters.             
             else:
@@ -145,6 +144,7 @@ class KMeansModule:
             I_batch.append(torch.stack(I_k))
         D_batch = torch.stack((D_batch))
         I_batch = torch.stack((I_batch))
+        # TODO: debug, verify whether stats indexes corresponds to target indexes i.e., they come out in the same order
         return D_batch, I_batch
 
 
