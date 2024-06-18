@@ -163,7 +163,7 @@ class HierarchicalClassifier(nn.Module):
             ) for num_children in num_children_per_parent]    
         )
 
-    def forward(self, x, device):
+    def forward(self, x):
         x = self.head_drop(x)
         parent_logits = self.parent_classifier(x)  # Shape (batch_size, num_parents)
         parent_probs = F.softmax(parent_logits, dim=1)  # Softmax over class dimension
@@ -172,7 +172,7 @@ class HierarchicalClassifier(nn.Module):
         parent_class = torch.argmax(parent_probs, dim=1)  # Argmax over class dimension: Shape (batch_size)
 
         # Use the predicted parent class to select the corresponding child classifier
-        child_logits = [torch.zeros(x.size(0), num, device=device) for num in self.num_children_per_parent] # Each element within child_logits is associated to a classifier with K outputs.
+        child_logits = [torch.zeros(x.size(0), num) for num in self.num_children_per_parent] # Each element within child_logits is associated to a classifier with K outputs.
         for i in range(len(self.num_children_per_parent)):
             for j in range(x.size(0)): # Iterate over each sample in the batch                   
                 # We will make predictions for each value of K belonging to num_children_per_parent (e.g., [2,3,4,5]) 

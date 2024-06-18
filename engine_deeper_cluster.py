@@ -294,6 +294,8 @@ def main(args, resume_preempt=False):
     else:
         criterion = torch.nn.CrossEntropyLoss()
 
+    CEL_no_reduction = torch.nn.CrossEntropyLoss(reduction='none')
+
     # -- # -- # -- #
     encoder = DistributedDataParallel(encoder, static_graph=True)
     predictor = DistributedDataParallel(predictor, static_graph=True)
@@ -439,19 +441,16 @@ def main(args, resume_preempt=False):
 
                     # Step 3. Compute K-Means assignments with disabled autocast as faiss requires float32
                     with torch.cuda.amp.autocast(enabled=False): 
-                        ''' Outputs should be a list of items in the shape:
-                            [(batch_size, len(k_range), 1), (batch_size, len(k_range), 1)]
-                            That is, the distances to the nearest clusters
-                            and the cluster assignments for each image in the batch, for each value of K within its range
-                        '''
                         k_means_losses, k_means_assignments = k_means_module.assign(x=bottleneck_output, y=targets, resources=res, rank=rank, device=device, cached_features=cached_features_last_epoch)  
 
-                    #k_means_loss = k_means_loss.to(device) TODO: VERIFY IF NECESSARY
+                    print('K-Means losses:', k_means_losses)
+                    print('K-Means losses:', k_means_losses.size())
                     print('Targets format:', target.size())
                     print('Assignments format', k_means_assignments.size()) 
 
                     # Step 4. Hierarchical Classification
-                    parent_logits, child_logits = hierarchical_classifier(h, device)
+                    parent_logits, child_logits = hierarchical_classifier(h)
+                    child_logits.to(device)
 
                     loss = loss_fn(parent_logits, targets) # TODO: verify whether all reduce should be kept within the lossfn or somewhere else
 
@@ -461,7 +460,6 @@ def main(args, resume_preempt=False):
                     print('Length:', len(child_logits))
                     print('Size @0:', child_logits[0].size())
                     
-
                     '''
                         TODO(s):
                             (1) - Check the label format of the target tensors and see if it the k_means assignments matches.
@@ -479,25 +477,40 @@ def main(args, resume_preempt=False):
                     for k in range(len(K_range)):
                         k_means_target = k_means_assignments[:,k,:]
                         k_means_target = k_means_target.squeeze(1)
-                        subclass_loss = loss_fn(child_logits[k], k_means_target)
+                        subclass_loss = CEL_no_reduction(child_logits[k], k_means_target) 
+                        print('Subclass loss shape', subclass_loss.size())
+                        print('Subclass loss', subclass_loss)
                         subclass_losses.append(subclass_loss)
 
-                    subclass_losses = torch.stack(subclass_losses)
-                    
-                    best_k_index = torch.argmin(subclass_losses)
-                    k_means_loss = k_means_losses[:, best_k_index, :]
-                    print('K-Means losses shape:', k_means_losses.size())
-                    print('K-Means (best-k) loss shape:', k_means_loss.size())
-                    print('K-Means (best-k) loss shape:', k_means_loss.squeeze(1).size())
-                    print('K-means best-k loss avg', )
+                    subclass_losses = torch.vstack(subclass_losses)
+                    print(subclass_losses)
+                    print(subclass_losses.size())
+                    best_k_indexes = torch.argmin(subclass_losses, dim=0)
+                    print('Best K index by datapoint:', best_k_indexes)
+                    print(best_k_indexes.size())
+                    subclass_loss = 0
+                    k_means_loss = 0
+                    k_means_losses = k_means_losses.squeeze(2).transpose(0,1)
+                    print('K-means losses:', k_means_losses.size())
+                    for i in range(batch_size):
+                        subclass_loss += subclass_losses[best_k_indexes[i]][i]
+                        k_means_loss += k_means_losses[best_k_indexes[i]][i]
+                    subclass_loss /= batch_size
+                    k_means_loss /= batch_size
 
                     # Add K-means distances term as penalty to enforce a "k-means friendly space" 
-                    reconstruction_loss += (0.25 * torch.mean(k_means_loss)) 
+                    reconstruction_loss += 0.25 * k_means_loss
 
                     # Update losses individually
                     parent_cls_loss_meter.update(loss)
                     children_cls_loss_meter.update(subclass_loss) 
+
+                    print('Losses')
+                    print('Parent class loss:', loss)
+                    print('Subclass loss', subclass_loss)
+                    print('K-means loss', k_means_loss)
                     
+                    subclass_loss = AllReduce.apply(subclass_loss)
                     # Sum parent and subclass loss
                     loss += subclass_loss
                 
