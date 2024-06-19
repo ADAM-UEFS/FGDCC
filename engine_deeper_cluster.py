@@ -339,7 +339,7 @@ def main(args, resume_preempt=False):
     
     # -- Override previously loaded optimization configs.
     # Create one optimizer that takes into account both encoder and its classifier parameters.
-    optimizer, AE_optimizer, scaler, scheduler, wd_scheduler = init_DC_opt(
+    optimizer, AE_optimizer, scaler_1, scaler_2, scheduler, wd_scheduler = init_DC_opt(
         encoder=target_encoder,
         classifier=hierarchical_classifier,
         autoencoder=autoencoder,
@@ -426,7 +426,7 @@ def main(args, resume_preempt=False):
                 # Additional allreduce might have considerable negative impact on training speed. See: https://discuss.pytorch.org/t/distributeddataparallel-loss-compute-and-backpropogation/47205/4                    
                 def loss_fn(h, targets):
                     loss = criterion(h, targets)
-                    loss = AllReduce.apply(loss) 
+                    loss = AllReduce.apply(loss).clone()
                     return loss 
 
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
@@ -443,16 +443,14 @@ def main(args, resume_preempt=False):
                     with torch.cuda.amp.autocast(enabled=False): 
                         k_means_losses, k_means_assignments = k_means_module.assign(x=bottleneck_output, y=targets, resources=res, rank=rank, device=device, cached_features=cached_features_last_epoch)  
 
-                    print('K-Means losses:', k_means_losses)
                     print('K-Means losses:', k_means_losses.size())
                     print('Targets format:', target.size())
                     print('Assignments format', k_means_assignments.size()) 
 
                     # Step 4. Hierarchical Classification
-                    parent_logits, child_logits = hierarchical_classifier(h)
-                    child_logits.to(device)
+                    parent_logits, child_logits = hierarchical_classifier(h, device)
 
-                    loss = loss_fn(parent_logits, targets) # TODO: verify whether all reduce should be kept within the lossfn or somewhere else
+                    loss = criterion(h, targets)# loss_fn(parent_logits, targets) # TODO: verify whether all reduce should be kept within the lossfn or somewhere else
 
                     print('Parent Logits info', parent_logits.size())
 
@@ -471,8 +469,7 @@ def main(args, resume_preempt=False):
                     # whereas we should find the best K across each data point, otherwise we could gather the mean of all losses
                     # instead.
 
-                    # Model selection: Iterate through every K classifier computing the loss then select the one with smallest value 
-                    #subclass_loss = [loss_fn(child_logits[i].to(device), k_means_assignments[i]) for i in range(len(K_range))]   
+                    # Model selection: Iterate through every K classifier computing the loss then select the ones with smallest values 
                     subclass_losses = []
                     for k in range(len(K_range)):
                         k_means_target = k_means_assignments[:,k,:]
@@ -497,9 +494,25 @@ def main(args, resume_preempt=False):
                         k_means_loss += k_means_losses[best_k_indexes[i]][i]
                     subclass_loss /= batch_size
                     k_means_loss /= batch_size
+                    
+                    # Sum parent and subclass loss
+                    loss += subclass_loss
 
                     # Add K-means distances term as penalty to enforce a "k-means friendly space" 
                     reconstruction_loss += 0.25 * k_means_loss
+
+                    '''
+                        `all_reduce`: is used to perform an element-wise reduction operation (like sum, product, max, min, etc.) 
+                        across all processes in a process group. 
+                        The result of the reduction is stored in each tensor across all processes.
+                        
+                        - When you need to aggregate or synchronize values (e.g., summing gradients, averaging losses, etc.) across all processes.
+                        - Typically used in model parameter synchronization during distributed training.
+                    '''
+                    #reconstruction_loss = AllReduce.apply(reconstruction_loss).clone()
+                    #k_means_loss = AllReduce.apply(k_means_loss).clone()
+                    #loss = AllReduce.apply(loss).clone()
+                    #subclass_loss = AllReduce.apply(subclass_loss).clone()
 
                     # Update losses individually
                     parent_cls_loss_meter.update(loss)
@@ -509,11 +522,8 @@ def main(args, resume_preempt=False):
                     print('Parent class loss:', loss)
                     print('Subclass loss', subclass_loss)
                     print('K-means loss', k_means_loss)
-                    
-                    subclass_loss = AllReduce.apply(subclass_loss)
-                    # Sum parent and subclass loss
-                    loss += subclass_loss
-                
+                    print('Autoencoder reconstruction loss', reconstruction_loss)
+
                 if accum_iter > 1:
                     loss_value = loss.item()
                     reconstruction_loss_value = reconstruction_loss.item()
@@ -526,17 +536,19 @@ def main(args, resume_preempt=False):
 
                 #  Step 2. Backward & step
                 if use_bfloat16:
-                    scaler(loss, optimizer, clip_grad=None,
-                                parameters=(list(target_encoder.parameters())+ list(hierarchical_classifier.parameters())), create_graph=False,
-                                update_grad=(itr + 1) % accum_iter == 0) # Scaling is only necessary when using bfloat16.                    
-                    
-                    scaler(reconstruction_loss, AE_optimizer, clip_grad=1.0,
-                                parameters=autoencoder.parameters(), create_graph=False,
+                    # retain_graph : if False, the graph used to compute the grads will be freed. 
+                    # create_graph : if True, allows to compute multiple order derivatives.
+                    scaler_2(reconstruction_loss, AE_optimizer, clip_grad=1.0,
+                                parameters=autoencoder.parameters(), create_graph=False, retain_graph=True,
                                 update_grad=(itr + 1) % accum_iter == 0)
+                    scaler_1(loss, optimizer, clip_grad=None,
+                                parameters=(list(target_encoder.parameters())+ list(hierarchical_classifier.parameters())),
+                                create_graph=False, retain_graph=False,
+                                update_grad=(itr + 1) % accum_iter == 0) # Scaling is only necessary when using bfloat16.   
+                    #with torch.autograd.set_detect_anomaly(True):
                 else:
                     loss.backward()
                     reconstruction_loss.backward()
-                    
                     optimizer.step()
                     AE_optimizer.step()
 

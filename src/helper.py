@@ -79,6 +79,7 @@ def load_DC_checkpoint(
     target_encoder,
     opt,
     scaler,
+    scaler2
 ):
     try:
         checkpoint = torch.load(r_path, map_location=torch.device('cpu'))
@@ -163,7 +164,7 @@ class HierarchicalClassifier(nn.Module):
             ) for num_children in num_children_per_parent]    
         )
 
-    def forward(self, x):
+    def forward(self, x, device):
         x = self.head_drop(x)
         parent_logits = self.parent_classifier(x)  # Shape (batch_size, num_parents)
         parent_probs = F.softmax(parent_logits, dim=1)  # Softmax over class dimension
@@ -172,7 +173,7 @@ class HierarchicalClassifier(nn.Module):
         parent_class = torch.argmax(parent_probs, dim=1)  # Argmax over class dimension: Shape (batch_size)
 
         # Use the predicted parent class to select the corresponding child classifier
-        child_logits = [torch.zeros(x.size(0), num) for num in self.num_children_per_parent] # Each element within child_logits is associated to a classifier with K outputs.
+        child_logits = [torch.zeros(x.size(0), num, device=device) for num in self.num_children_per_parent] # Each element within child_logits is associated to a classifier with K outputs.
         for i in range(len(self.num_children_per_parent)):
             for j in range(x.size(0)): # Iterate over each sample in the batch                   
                 # We will make predictions for each value of K belonging to num_children_per_parent (e.g., [2,3,4,5]) 
@@ -295,8 +296,8 @@ class NativeScalerWithGradNormCount:
     def __init__(self):
         self._scaler = torch.cuda.amp.GradScaler()
 
-    def __call__(self, loss, optimizer, clip_grad=None, parameters=None, create_graph=False, update_grad=True):
-        self._scaler.scale(loss).backward(create_graph=create_graph)
+    def __call__(self, loss, optimizer, clip_grad=None, parameters=None, create_graph=False, retain_graph=None, update_grad=True):
+        self._scaler.scale(loss).backward(create_graph=create_graph, retain_graph=retain_graph)
         if update_grad:
             if clip_grad is not None:
                 assert parameters is not None
@@ -487,5 +488,6 @@ def init_DC_opt(
         ref_wd=wd,
         final_wd=final_wd,
         T_max=int(ipe_scale*num_epochs*iterations_per_epoch))
-    scaler = NativeScalerWithGradNormCount() if use_bfloat16 else None
-    return optimizer, AE_optimizer, scaler, scheduler, wd_scheduler 
+    scaler_1 = NativeScalerWithGradNormCount() if use_bfloat16 else None
+    scaler_2 = NativeScalerWithGradNormCount() if use_bfloat16 else None
+    return optimizer, AE_optimizer, scaler_1, scaler_2, scheduler, wd_scheduler 
