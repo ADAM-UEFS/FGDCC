@@ -41,8 +41,6 @@ from src.utils.logging import (
     grad_logger,
     AverageMeter)
 
-from src.utils.tensors import repeat_interleave_batch
-from src.datasets.imagenet1k import make_imagenet1k
 from src.datasets.FineTuningDataset import make_GenericDataset
 
 from src.helper import (
@@ -52,7 +50,8 @@ from src.helper import (
     load_DC_checkpoint,
     init_model,
     init_opt,
-    init_DC_opt
+    init_DC_opt,
+    build_cache
     )
 from src.transforms import make_transforms
 import time
@@ -302,7 +301,6 @@ def main(args, resume_preempt=False):
     target_encoder = DistributedDataParallel(target_encoder, static_graph=True)
     autoencoder = DistributedDataParallel(autoencoder, static_graph=True)
 
-
     # -- Load ImageNet weights
     if resume_epoch == 0:    
         encoder, predictor, target_encoder, optimizer, scaler, start_epoch = load_checkpoint(
@@ -339,7 +337,7 @@ def main(args, resume_preempt=False):
     
     # -- Override previously loaded optimization configs.
     # Create one optimizer that takes into account both encoder and its classifier parameters.
-    optimizer, AE_optimizer, scaler_1, scaler_2, scheduler, wd_scheduler = init_DC_opt(
+    optimizer, AE_optimizer, scaler, scheduler, wd_scheduler = init_DC_opt(
         encoder=target_encoder,
         classifier=hierarchical_classifier,
         autoencoder=autoencoder,
@@ -355,7 +353,15 @@ def main(args, resume_preempt=False):
         use_bfloat16=use_bfloat16)
     
     target_encoder = DistributedDataParallel(target_encoder, static_graph=True) # Static Graph: the set of used and unused parameters will not change during the whole training loop.
-    hierarchical_classifier = DistributedDataParallel(hierarchical_classifier, static_graph=True) # Static Graph: the set of used and unused parameters will not change during the whole training loop.
+    
+    # Debugging
+    # RuntimeError: Your training graph has changed in this iteration, e.g., one parameter is unused in first iteration, but then got used in the second iteration. 
+    # this is not compatible with static_graph set to True.
+    # What we have done it here: Setting static graph equals false and find_unused_parameters=true.
+    # The problem is related to the hierarchical classifier, but why?
+    # TODO: apply dist.barrier after the cache loading.
+    #   
+    hierarchical_classifier = DistributedDataParallel(hierarchical_classifier, static_graph=False, find_unused_parameters=True) # Static Graph: the set of used and unused parameters will not change during the whole training loop.
     
     # TODO: ADJUST THIS later!
     if resume_epoch != 0:
@@ -377,7 +383,10 @@ def main(args, resume_preempt=False):
     
     accum_iter = 1
     start_epoch = resume_epoch
+
+    cached_features_last_epoch = build_cache(data_loader=supervised_loader_train, device=device, target_encoder=target_encoder, autoencoder=autoencoder)
     
+    cached_features_last_epoch= None
     #resources = [faiss.StandardGpuResources() for i in range(world_size)]
     res = faiss.StandardGpuResources()
     cfg = faiss.GpuIndexFlatConfig()
@@ -388,13 +397,11 @@ def main(args, resume_preempt=False):
     K_range = [2,3,4,5]
     k_means_module = KMeans.KMeansModule(nb_classes, dimensionality=256, k_range=K_range, resources=res, config=cfg)
 
-    cached_features_last_epoch = None
-    cached_features = {}
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
-        
-        logger.info('Epoch %d' % (epoch + 1))
 
+        logger.info('Epoch %d' % (epoch + 1))
+        
         supervised_sampler_train.set_epoch(epoch) # Calling the set_epoch() method at the beginning of each epoch before creating the DataLoader iterator is necessary to make shuffling work properly across multiple epochs.
         
         cls_loss_meter = AverageMeter()
@@ -405,7 +412,7 @@ def main(args, resume_preempt=False):
 
         target_encoder.train(True)
 
-        
+        cached_features = {}
         for itr, (sample, target) in enumerate(supervised_loader_train):
             
             def load_imgs():
@@ -434,10 +441,12 @@ def main(args, resume_preempt=False):
                     # Step 1. Forward into the encoder
                     h = target_encoder(imgs) 
 
+                    h_detached = h.detach() # Detaching will prevent autograd from backpropagating the autoencoder gradients to the vision transformer model 
+                    
                     # Step 2. Autoencoder Dimensionality Reduction  
-                    reconstructed_input, bottleneck_output = autoencoder(h)                     
+                    reconstructed_input, bottleneck_output = autoencoder(h_detached)                     
 
-                    reconstruction_loss = F.smooth_l1_loss(reconstructed_input, h)
+                    reconstruction_loss = F.smooth_l1_loss(reconstructed_input, h_detached)
 
                     # Step 3. Compute K-Means assignments with disabled autocast as faiss requires float32
                     with torch.cuda.amp.autocast(enabled=False): 
@@ -450,7 +459,7 @@ def main(args, resume_preempt=False):
                     # Step 4. Hierarchical Classification
                     parent_logits, child_logits = hierarchical_classifier(h, device)
 
-                    loss = criterion(h, targets)# loss_fn(parent_logits, targets) # TODO: verify whether all reduce should be kept within the lossfn or somewhere else
+                    loss = criterion(h, targets) # loss_fn(parent_logits, targets) # TODO: verify whether all reduce should be kept within the lossfn or somewhere else
 
                     print('Parent Logits info', parent_logits.size())
 
@@ -458,17 +467,6 @@ def main(args, resume_preempt=False):
                     print('Length:', len(child_logits))
                     print('Size @0:', child_logits[0].size())
                     
-                    '''
-                        TODO(s):
-                            (1) - Check the label format of the target tensors and see if it the k_means assignments matches.
-                            (2) - Send the tensors above to the proper device. FIXME verify why child logits are in cpu instead of cuda:0
-                            (3) - Find the index of the best K and gather the corresponding losses for that i.e., k_means_loss[:, "best_k", 0]
-                            then (print to see if are scalars), and verify whether we should add its average or its sum.                            
-                    '''
-                    # TODO review: I guess that the way this is implemented below is allowing to find the best K across the batch
-                    # whereas we should find the best K across each data point, otherwise we could gather the mean of all losses
-                    # instead.
-
                     # Model selection: Iterate through every K classifier computing the loss then select the ones with smallest values 
                     subclass_losses = []
                     for k in range(len(K_range)):
@@ -538,45 +536,40 @@ def main(args, resume_preempt=False):
                 if use_bfloat16:
                     # retain_graph : if False, the graph used to compute the grads will be freed. 
                     # create_graph : if True, allows to compute multiple order derivatives.
-                    scaler_2(reconstruction_loss, AE_optimizer, clip_grad=1.0,
-                                parameters=autoencoder.parameters(), create_graph=False, retain_graph=True,
+                    scaler(reconstruction_loss, AE_optimizer, clip_grad=1.0,
+                                parameters=autoencoder.parameters(), create_graph=False, retain_graph=False,
                                 update_grad=(itr + 1) % accum_iter == 0)
-                    scaler_1(loss, optimizer, clip_grad=None,
+                    
+                    scaler(loss, optimizer, clip_grad=None,
                                 parameters=(list(target_encoder.parameters())+ list(hierarchical_classifier.parameters())),
                                 create_graph=False, retain_graph=False,
                                 update_grad=(itr + 1) % accum_iter == 0) # Scaling is only necessary when using bfloat16.   
-                    #with torch.autograd.set_detect_anomaly(True):
                 else:
-                    loss.backward()
                     reconstruction_loss.backward()
+                    loss.backward()
                     optimizer.step()
                     AE_optimizer.step()
 
-                grad_stats = grad_logger(target_encoder.named_parameters())
+                grad_stats = grad_logger(list(target_encoder.named_parameters())+ list(hierarchical_classifier.named_parameters()))
                 
                 if (itr + 1) % accum_iter == 0:
                     optimizer.zero_grad()
                     AE_optimizer.zero_grad()
 
-                return (loss_value, reconstruction_loss_value, _new_lr, _new_wd, grad_stats, bottleneck_output)
+                # FIXME: return loss values 
+                return (float(loss), float(reconstruction_loss), _new_lr, _new_wd, grad_stats, bottleneck_output)
 
             (loss, reconstruction_loss, _new_lr, _new_wd, grad_stats, bottleneck_output), etime = gpu_timer(train_step)
+                       
+            bottleneck_output = bottleneck_output.to(device=torch.device('cpu'), dtype=torch.float32) # Verify if apply dist.barrier
+            def update_cache(cache):
+                for x, y in zip(bottleneck_output, target):
+                    if not y in cache:
+                        cache[y] = []                    
+                    cache[y].append(x)
+                return cache
             
-            # TODO VERIFY: Guess that reduction should be applied below
-            bottleneck_output.to(device=torch.device('cpu'), dtype=torch.float32)
-            target.to(device=torch.device('cpu'))
-            
-            ##################### TODO TEST #########################
-            # TODO: Modularize, speedup with parallel processing...
-            for i in range(target.size(0)):
-                y = target[i]
-                x = bottleneck_output[i]
-                if cached_features[y] is None:
-                    cached_features[y] = [(x,y)]
-                else:
-                    cached_features[y].append((x,y))
-            #########################################################
-            #cached_features = torch.cat((cached_features, [bottleneck_output.to(device=torch.device('cpu'), dtype=torch.float32), target]))
+            cached_features = update_cache(cached_features) # TODO: Verify if filled at the end of epoch []
 
             cls_loss_meter.update(loss)
             reconstruction_loss_meter.update(reconstruction_loss)
@@ -608,7 +601,7 @@ def main(args, resume_preempt=False):
                                         grad_stats.max))
             log_stats()
         
-        cached_features_last_iter = cached_features # TODO this won't work, we have to perform a formal copy.
+        cached_features_last_epoch = cached_features.copy()
         
         # Perform M step on K-means module
         k_means_module.update(cached_features) # TODO: implement

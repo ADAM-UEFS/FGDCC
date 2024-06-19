@@ -285,9 +285,7 @@ def get_classification_head(embed_dim, drop_path, nb_classes, K_range, device):
                                    drop_path=drop_path,
                                    num_children_per_parent=K_range)        
     model.to(device)
-    return model         
-
-        
+    return model                 
 
 # Borrowed from MAE.
 class NativeScalerWithGradNormCount:
@@ -333,7 +331,6 @@ def get_grad_norm_(parameters, norm_type: float = 2.0) -> torch.Tensor:
         total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters]), norm_type)
     return total_norm
 
-
 def init_model(
     device,
     patch_size=16,
@@ -372,27 +369,43 @@ def init_model(
     for m in predictor.modules():
         init_weights(m)
 
-
     autoencoder.to(device)
     encoder.to(device)
     predictor.to(device)
     
     return encoder, predictor, autoencoder
 
-
-def build_cache(data_loader, device, target_encoder, autoencoder):
-    for itr, (sample, target) in enumerate(data_loader):    
-        def load_imgs():
-            samples = sample.to(device, non_blocking=True)
-            targets = target.to(device, non_blocking=True)
-            return (samples, targets)
-        imgs, targets = load_imgs()            
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):            
-            h = target_encoder(imgs)
-            reconstructed_input, bottleneck_output = autoencoder(h)
-
-    return 0
-
+def build_cache(data_loader, device, target_encoder, autoencoder):        
+    target_encoder.eval()
+    autoencoder.eval()
+    items = []
+    def forward_inputs():
+        for itr, (sample, target) in enumerate(data_loader):
+            def load_imgs():
+                samples = sample.to(device, non_blocking=True)
+                targets = target.to(device, non_blocking=True)
+                return (samples, targets)
+            imgs, targets = load_imgs()            
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):            
+                h = target_encoder(imgs)
+                _, bottleneck_output = autoencoder(h)        
+                items.append((bottleneck_output, target))
+            break
+           
+    def build_cache():
+        cache = {}
+        for bottleneck_output, target in items:
+            bottleneck_output = bottleneck_output.to(device=torch.device('cpu'), dtype=torch.float32)
+            for x, y in zip(bottleneck_output, target):
+                if not y in cache:
+                    cache[y] = []                    
+                cache[y].append(x)
+        return cache
+    forward_inputs()
+    cache = build_cache()
+    autoencoder.train(True)
+    target_encoder.train(True)
+    return cache
 
 def init_opt(
     encoder,
@@ -488,6 +501,5 @@ def init_DC_opt(
         ref_wd=wd,
         final_wd=final_wd,
         T_max=int(ipe_scale*num_epochs*iterations_per_epoch))
-    scaler_1 = NativeScalerWithGradNormCount() if use_bfloat16 else None
-    scaler_2 = NativeScalerWithGradNormCount() if use_bfloat16 else None
-    return optimizer, AE_optimizer, scaler_1, scaler_2, scheduler, wd_scheduler 
+    scaler = NativeScalerWithGradNormCount() if use_bfloat16 else None
+    return optimizer, AE_optimizer, scaler, scheduler, wd_scheduler 
