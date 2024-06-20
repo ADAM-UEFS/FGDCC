@@ -63,7 +63,7 @@ class KMeansModule:
         else:
             self.n_kmeans = []   
             for _ in range(nb_classes):
-                self.n_kmeans.append([faiss.Kmeans(d=dimensionality, k=k, niter=1, verbose=True, min_points_per_centroid = 1) for k in k_range])                                                            
+                self.n_kmeans.append([faiss.Kmeans(d=dimensionality, k=k, niter=1, verbose=False, min_points_per_centroid = 1) for k in k_range])                                                            
         
     '''
         Assigns a single data point to the set of clusters correspondent to the y target.
@@ -138,17 +138,22 @@ class KMeansModule:
         return D_batch, I_batch
 
     def update(self, cached_features, device):
+        means = [[] for k in self.k_range]
         for key in cached_features.keys():
             xb = torch.stack(cached_features[key])
             _, batch_k_means_loss = self.iterative_kmeans(xb, key, device) # TODO: sum and average across dataset length
             # log_loss.update(batch_k_means_loss.mean())
-            print('K-Means losses per K value', batch_k_means_loss.size())
-
-        return 0
+            for k in range(len(self.k_range)):
+                means[k].append(batch_k_means_loss[k].mean())
+            #print('K-Means losses per K value', batch_k_means_loss.size())
+        losses = []
+        for k in range(len(self.k_range)):
+            stack = torch.stack(means[k])
+            losses.append(stack.mean())
+        return losses
 
     # TODO: print centroid before and after updating
     def iterative_kmeans(self, xb, k_means_index, device):
-        
         D_per_K_value = []
         for itr in range(self.n_iter - 1):  # n_iter-1 because we already did one iteration
             # Update K-Means for each value of K 

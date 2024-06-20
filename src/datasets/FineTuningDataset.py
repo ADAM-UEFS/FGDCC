@@ -89,7 +89,9 @@ def make_GenericDataset(
     
     index_targets = False 
     
-    dataset = build_dataset(is_train=training, image_folder=image_folder) 
+    dataset = build_dataset(is_train=training, image_folder=image_folder)
+
+    #print(dataset.class_to_idx) 
 
     logger.info('Finetuning dataset created')
 

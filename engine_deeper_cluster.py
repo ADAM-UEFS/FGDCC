@@ -67,8 +67,8 @@ import faiss
 
 # --
 log_timings = True
-log_freq = 50
-checkpoint_freq = 5
+log_freq = 25
+checkpoint_freq = 1
 # --
 
 _GLOBAL_SEED = 0
@@ -385,8 +385,11 @@ def main(args, resume_preempt=False):
     dist.barrier()
     cnt = 0
     for key in cached_features_last_epoch.keys():
-        cnt += len(cached_features_last_epoch[key])
-    assert cnt == 243916, 'Cache not compatible, corrupted or missing'
+        l = len(cached_features_last_epoch[key])
+        if l < 10:
+            print(key)
+        cnt += l
+    assert cnt == 245897, 'Cache not compatible, corrupted or missing' # Img qtt before = 243916
     logger.info('Cache ready')
     
     #resources = [faiss.StandardGpuResources() for i in range(world_size)]
@@ -413,6 +416,7 @@ def main(args, resume_preempt=False):
         time_meter = AverageMeter()
 
         target_encoder.train(True)
+        hierarchical_classifier.train(True)
 
         cached_features = {}
         for itr, (sample, target) in enumerate(supervised_loader_train):
@@ -607,7 +611,8 @@ def main(args, resume_preempt=False):
         logger.info('No. samples in the cache:', cnt, 'Num. classes:', len(cached_features.keys()))
 
         # Perform M step on K-means module
-        k_means_module.update(cached_features)
+        M_losses = k_means_module.update(cached_features, device)
+        logger.info('Losses after M step: ', M_losses)
 
         cached_features_last_epoch = copy.deepcopy(cached_features)
 
@@ -621,8 +626,8 @@ def main(args, resume_preempt=False):
         @torch.no_grad()
         def evaluate():
             crossentropy = torch.nn.CrossEntropyLoss()
-
-            target_encoder.eval()              
+            target_encoder.eval()
+            hierarchical_classifier.eval()              
             supervised_sampler_val.set_epoch(epoch) # -- Enable shuffling to reduce monitor bias
             
             for cnt, (samples, targets) in enumerate(supervised_loader_val):
@@ -631,7 +636,8 @@ def main(args, resume_preempt=False):
                                  
                 with torch.cuda.amp.autocast():
                     output = target_encoder(images)
-                    loss = crossentropy(output, labels)
+                    parent_logits, _ = hierarchical_classifier(output, device)                    
+                    loss = crossentropy(parent_logits, labels)
                 
                 acc1, acc5 = accuracy(output, labels, topk=(1, 5))
 
