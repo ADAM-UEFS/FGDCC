@@ -55,6 +55,7 @@ from src.helper import (
     )
 from src.transforms import make_transforms
 import time
+import torch.distributed as dist
 
 # --BROUGHT fRoM MAE
 from timm.data.mixup import Mixup
@@ -66,7 +67,7 @@ import faiss
 
 # --
 log_timings = True
-log_freq = 100
+log_freq = 50
 checkpoint_freq = 5
 # --
 
@@ -238,7 +239,7 @@ def main(args, resume_preempt=False):
             root_path=root_path,
             image_folder=image_folder,
             copy_data=copy_data,
-            drop_last=True)
+            drop_last=False)
     ipe = len(supervised_loader_train)
     print('Training dataset, length:', ipe*batch_size)
 
@@ -257,7 +258,7 @@ def main(args, resume_preempt=False):
             root_path=root_path,
             image_folder=image_folder,
             copy_data=copy_data,
-            drop_last=True)
+            drop_last=False)
     
     ipe_val = len(supervised_loader_val)
 
@@ -352,15 +353,7 @@ def main(args, resume_preempt=False):
         ipe_scale=ipe_scale,
         use_bfloat16=use_bfloat16)
     
-    target_encoder = DistributedDataParallel(target_encoder, static_graph=True) # Static Graph: the set of used and unused parameters will not change during the whole training loop.
-    
-    # Debugging
-    # RuntimeError: Your training graph has changed in this iteration, e.g., one parameter is unused in first iteration, but then got used in the second iteration. 
-    # this is not compatible with static_graph set to True.
-    # What we have done it here: Setting static graph equals false and find_unused_parameters=true.
-    # The problem is related to the hierarchical classifier, but why?
-    # TODO: apply dist.barrier after the cache loading.
-    #   
+    target_encoder = DistributedDataParallel(target_encoder, static_graph=True) # Static Graph: the set of used and unused parameters will not change during the whole training loop.    
     hierarchical_classifier = DistributedDataParallel(hierarchical_classifier, static_graph=False, find_unused_parameters=True) # Static Graph: the set of used and unused parameters will not change during the whole training loop.
     
     # TODO: ADJUST THIS later!
@@ -380,20 +373,27 @@ def main(args, resume_preempt=False):
     # -- Remove from device once they are required for loading pretrained parameters only
     del encoder
     del predictor
-    
+
     accum_iter = 1
     start_epoch = resume_epoch
-
-    cached_features_last_epoch = build_cache(data_loader=supervised_loader_train, device=device, target_encoder=target_encoder, autoencoder=autoencoder)
     
-    cached_features_last_epoch= None
+    logger.info('Building cache...')
+    cached_features_last_epoch = build_cache(data_loader=supervised_loader_train,
+                                             device=device, target_encoder=target_encoder,
+                                             autoencoder=autoencoder,
+                                             path=root_path+'/DeepCluster/cache')
+    dist.barrier()
+    cnt = 0
+    for key in cached_features_last_epoch.keys():
+        cnt += len(cached_features_last_epoch[key])
+    assert cnt == 243916, 'Cache not compatible, corrupted or missing'
+    logger.info('Cache ready')
+    
     #resources = [faiss.StandardGpuResources() for i in range(world_size)]
     res = faiss.StandardGpuResources()
     cfg = faiss.GpuIndexFlatConfig()
     cfg.device = rank
     
-    # TODO: check where to apply the following: 
-    # index.reset() should clear out the contents but keep any learned parameters that it was trained on.
     K_range = [2,3,4,5]
     k_means_module = KMeans.KMeansModule(nb_classes, dimensionality=256, k_range=K_range, resources=res, config=cfg)
 
@@ -404,10 +404,12 @@ def main(args, resume_preempt=False):
         
         supervised_sampler_train.set_epoch(epoch) # Calling the set_epoch() method at the beginning of each epoch before creating the DataLoader iterator is necessary to make shuffling work properly across multiple epochs.
         
-        cls_loss_meter = AverageMeter()
+        total_loss_meter = AverageMeter()
         parent_cls_loss_meter = AverageMeter()
         children_cls_loss_meter = AverageMeter()
         reconstruction_loss_meter = AverageMeter()
+        k_means_loss_meter = AverageMeter()
+
         time_meter = AverageMeter()
 
         target_encoder.train(True)
@@ -450,22 +452,17 @@ def main(args, resume_preempt=False):
 
                     # Step 3. Compute K-Means assignments with disabled autocast as faiss requires float32
                     with torch.cuda.amp.autocast(enabled=False): 
-                        k_means_losses, k_means_assignments = k_means_module.assign(x=bottleneck_output, y=targets, resources=res, rank=rank, device=device, cached_features=cached_features_last_epoch)  
+                        k_means_losses, k_means_assignments = k_means_module.assign(x=bottleneck_output, y=target, resources=res, rank=rank, device=device, cached_features=cached_features_last_epoch)  
 
-                    print('K-Means losses:', k_means_losses.size())
-                    print('Targets format:', target.size())
-                    print('Assignments format', k_means_assignments.size()) 
+                    #print('K-Means losses:', k_means_losses.size())
+                    #print('Targets format:', target.size())
+                    #print('Assignments format', k_means_assignments.size()) 
 
                     # Step 4. Hierarchical Classification
                     parent_logits, child_logits = hierarchical_classifier(h, device)
 
-                    loss = criterion(h, targets) # loss_fn(parent_logits, targets) # TODO: verify whether all reduce should be kept within the lossfn or somewhere else
-
-                    print('Parent Logits info', parent_logits.size())
-
-                    print('child logits info:')
-                    print('Length:', len(child_logits))
-                    print('Size @0:', child_logits[0].size())
+                    loss = loss_fn(parent_logits, targets)
+                    parent_cls_loss_meter.update(loss)
                     
                     # Model selection: Iterate through every K classifier computing the loss then select the ones with smallest values 
                     subclass_losses = []
@@ -473,32 +470,37 @@ def main(args, resume_preempt=False):
                         k_means_target = k_means_assignments[:,k,:]
                         k_means_target = k_means_target.squeeze(1)
                         subclass_loss = CEL_no_reduction(child_logits[k], k_means_target) 
-                        print('Subclass loss shape', subclass_loss.size())
-                        print('Subclass loss', subclass_loss)
+                        #print('Subclass loss shape', subclass_loss.size())
+                        #print('Subclass loss', subclass_loss)
                         subclass_losses.append(subclass_loss)
 
                     subclass_losses = torch.vstack(subclass_losses)
-                    print(subclass_losses)
-                    print(subclass_losses.size())
+                    #print(subclass_losses)
+                    #print(subclass_losses.size())
                     best_k_indexes = torch.argmin(subclass_losses, dim=0)
-                    print('Best K index by datapoint:', best_k_indexes)
-                    print(best_k_indexes.size())
+                    #print('Best K index by datapoint:', best_k_indexes)
+                    #print(best_k_indexes.size())
                     subclass_loss = 0
                     k_means_loss = 0
                     k_means_losses = k_means_losses.squeeze(2).transpose(0,1)
-                    print('K-means losses:', k_means_losses.size())
+                    #print('K-means losses:', k_means_losses.size())
                     for i in range(batch_size):
                         subclass_loss += subclass_losses[best_k_indexes[i]][i]
                         k_means_loss += k_means_losses[best_k_indexes[i]][i]
+
+                    # Update loss meters                    
                     subclass_loss /= batch_size
                     k_means_loss /= batch_size
+
+                    subclass_loss = AllReduce.apply(subclass_loss).clone()
+                    children_cls_loss_meter.update(subclass_loss)
                     
                     # Sum parent and subclass loss
                     loss += subclass_loss
-
-                    # Add K-means distances term as penalty to enforce a "k-means friendly space" 
-                    reconstruction_loss += 0.25 * k_means_loss
-
+                    
+                    reconstruction_loss = AllReduce.apply(reconstruction_loss).clone()
+                    reconstruction_loss_meter.update(reconstruction_loss)
+                    reconstruction_loss += 0.25 * k_means_loss # Add K-means distances term as penalty to enforce a "k-means friendly space" 
                     '''
                         `all_reduce`: is used to perform an element-wise reduction operation (like sum, product, max, min, etc.) 
                         across all processes in a process group. 
@@ -507,22 +509,19 @@ def main(args, resume_preempt=False):
                         - When you need to aggregate or synchronize values (e.g., summing gradients, averaging losses, etc.) across all processes.
                         - Typically used in model parameter synchronization during distributed training.
                     '''
-                    #reconstruction_loss = AllReduce.apply(reconstruction_loss).clone()
-                    #k_means_loss = AllReduce.apply(k_means_loss).clone()
                     #loss = AllReduce.apply(loss).clone()
+                    
+                    #k_means_loss = AllReduce.apply(k_means_loss).clone()
                     #subclass_loss = AllReduce.apply(subclass_loss).clone()
+                    
+                    #print('Losses')
+                    #print('Parent class loss:', loss)
+                    #print('Subclass loss', subclass_loss)
+                    #print('K-means loss', k_means_loss)
+                    #print('Autoencoder reconstruction loss', reconstruction_loss)
 
-                    # Update losses individually
-                    parent_cls_loss_meter.update(loss)
-                    children_cls_loss_meter.update(subclass_loss) 
-
-                    print('Losses')
-                    print('Parent class loss:', loss)
-                    print('Subclass loss', subclass_loss)
-                    print('K-means loss', k_means_loss)
-                    print('Autoencoder reconstruction loss', reconstruction_loss)
-
-                if accum_iter > 1:
+                # TODO: fix
+                if accum_iter > 1: 
                     loss_value = loss.item()
                     reconstruction_loss_value = reconstruction_loss.item()
 
@@ -556,37 +555,29 @@ def main(args, resume_preempt=False):
                     optimizer.zero_grad()
                     AE_optimizer.zero_grad()
 
-                # FIXME: return loss values 
-                return (float(loss), float(reconstruction_loss), _new_lr, _new_wd, grad_stats, bottleneck_output)
+                return (float(loss), float(k_means_loss), _new_lr, _new_wd, grad_stats, bottleneck_output)
 
-            (loss, reconstruction_loss, _new_lr, _new_wd, grad_stats, bottleneck_output), etime = gpu_timer(train_step)
+            (loss, k_means_loss, _new_lr, _new_wd, grad_stats, bottleneck_output), etime = gpu_timer(train_step)
                        
-            bottleneck_output = bottleneck_output.to(device=torch.device('cpu'), dtype=torch.float32) # Verify if apply dist.barrier
-            def update_cache(cache):
-                for x, y in zip(bottleneck_output, target):
-                    if not y in cache:
-                        cache[y] = []                    
-                    cache[y].append(x)
-                return cache
-            
-            cached_features = update_cache(cached_features) # TODO: Verify if filled at the end of epoch []
-
-            cls_loss_meter.update(loss)
-            reconstruction_loss_meter.update(reconstruction_loss)
+            total_loss_meter.update(loss)
+            k_means_loss_meter.update(k_means_loss)
             time_meter.update(etime)
 
             # -- Logging
             def log_stats():
-                # TODO: ADJUST LOGGING to accomodate new stats !!!
                 csv_logger.log(epoch + 1, itr, loss, etime)
                 if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
-                    logger.info('[%d, %5d/%5d] train_loss: %.3f '
+                    logger.info('[%d, %5d/%5d] - train_losses - Parent Class: %.3f -'
+                                ' Children class: %.3f -'
+                                'Autoencoder Loss (total): %.3f - Reconstruction/K-Means Loss: [%.3f / %.3f] - '
                                 '[wd: %.2e] [lr: %.2e] '
                                 '[mem: %.2e] '
                                 '(%.1f ms)'
 
                                 % (epoch + 1, itr, ipe,
-                                    cls_loss_meter.avg,
+                                    total_loss_meter.avg,
+                                    children_cls_loss_meter.avg,
+                                    (reconstruction_loss_meter.avg + k_means_loss_meter.avg), reconstruction_loss_meter.avg, k_means_loss_meter.avg,
                                     _new_wd,
                                     _new_lr,
                                     torch.cuda.max_memory_allocated() / 1024.**2,
@@ -600,11 +591,25 @@ def main(args, resume_preempt=False):
                                         grad_stats.min,
                                         grad_stats.max))
             log_stats()
-        
-        cached_features_last_epoch = cached_features.copy()
-        
+            bottleneck_output = bottleneck_output.to(device=torch.device('cpu'), dtype=torch.float32) # Verify if apply dist.barrier
+            
+            def update_cache(cache):
+                for x, y in zip(bottleneck_output, target):
+                    if not y in cache:
+                        cache[y] = []                    
+                    cache[y].append(x)
+                return cache
+            
+            cached_features = update_cache(cached_features) # TODO: Verify if filled at the end of epoch []
+        cnt = 0
+        for key in cached_features.keys():
+            cnt += len(cached_features[key])
+        logger.info('No. samples in the cache:', cnt, 'Num. classes:', len(cached_features.keys()))
+
         # Perform M step on K-means module
-        k_means_module.update(cached_features) # TODO: implement
+        k_means_module.update(cached_features)
+
+        cached_features_last_epoch = copy.deepcopy(cached_features)
 
         testAcc1 = AverageMeter()
         testAcc5 = AverageMeter()
@@ -637,7 +642,7 @@ def main(args, resume_preempt=False):
         vtime = gpu_timer(evaluate)
         
         # -- Save Checkpoint after every epoch
-        logger.info('avg. train_loss %.3f' % cls_loss_meter.avg)
+        logger.info('avg. train_loss %.3f' % total_loss_meter.avg)
         logger.info('avg. test_loss %.3f avg. Accuracy@1 %.3f - avg. Accuracy@5 %.3f' % (test_loss.avg, testAcc1.avg, testAcc5.avg))
         save_checkpoint(epoch+1)
         assert not np.isnan(loss), 'loss is nan'

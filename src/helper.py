@@ -23,7 +23,7 @@ import src.models.autoencoder as AE
 
 # from timm.models.layers import trunc_normal_ 
 import util.lr_decay as lrd
-
+import os
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger()
@@ -375,34 +375,41 @@ def init_model(
     
     return encoder, predictor, autoencoder
 
-def build_cache(data_loader, device, target_encoder, autoencoder):        
+def build_cache(data_loader, device, target_encoder, autoencoder, path):   
+
     target_encoder.eval()
     autoencoder.eval()
+
     items = []
     def forward_inputs():
-        for itr, (sample, target) in enumerate(data_loader):
-            def load_imgs():
-                samples = sample.to(device, non_blocking=True)
-                targets = target.to(device, non_blocking=True)
-                return (samples, targets)
-            imgs, targets = load_imgs()            
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):            
-                h = target_encoder(imgs)
-                _, bottleneck_output = autoencoder(h)        
-                items.append((bottleneck_output, target))
-            break
+        with torch.no_grad():
+            for itr, (sample, target) in enumerate(data_loader):
+                def load_imgs():
+                    samples = sample.to(device, non_blocking=True)
+                    targets = target.to(device, non_blocking=True)
+                    return (samples, targets)
+                imgs, _ = load_imgs()            
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):            
+                    h = target_encoder(imgs)
+                    _, bottleneck_output = autoencoder(h)
+                    items.append((bottleneck_output, target))
            
     def build_cache():
-        cache = {}
+        cache = {}        
         for bottleneck_output, target in items:
             bottleneck_output = bottleneck_output.to(device=torch.device('cpu'), dtype=torch.float32)
             for x, y in zip(bottleneck_output, target):
+                y = y.item()
                 if not y in cache:
                     cache[y] = []                    
                 cache[y].append(x)
         return cache
-    forward_inputs()
-    cache = build_cache()
+    if not os.path.exists(path + '/cached_features_epoch_0.pt'):
+        forward_inputs()
+        cache = build_cache()
+        torch.save(cache, path + '/cached_features_epoch_0.pt')
+    else:
+        cache = torch.load(path + '/cached_features_epoch_0.pt')        
     autoencoder.train(True)
     target_encoder.train(True)
     return cache
