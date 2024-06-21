@@ -106,7 +106,6 @@ def main(args, resume_preempt=False):
     use_color_distortion = args['data']['use_color_distortion']
     color_jitter = args['data']['color_jitter_strength']
 
-
     drop_path = args['data']['drop_path']
     mixup = args['data']['mixup']
     cutmix = args['data']['cutmix']
@@ -389,7 +388,7 @@ def main(args, resume_preempt=False):
         if l < 10:
             print(key)
         cnt += l
-    assert cnt == 245897, 'Cache not compatible, corrupted or missing' # Img qtt before = 243916
+    assert cnt == 245897, 'Cache not compatible, corrupted or missing' # Img qtt before upsampling = 243916
     logger.info('Cache ready')
     
     #resources = [faiss.StandardGpuResources() for i in range(world_size)]
@@ -418,7 +417,13 @@ def main(args, resume_preempt=False):
         target_encoder.train(True)
         hierarchical_classifier.train(True)
 
-        cached_features = {}
+        # TODO REMINDER: Cached features is indexed by tensors (i.e., (Tensor 123)) which means that it will use
+        # not the tensor value but the tensor id assigned by pytorch.
+        # This note is a reminder in the sense that the first epoch's cache is indexed by integers (class ids) instead.
+        # Also, this is also a debug warning because we have to inspect the other problems that this approach can generate.
+        # That is because tensors with same values have different ids and therefore this kind of index should not be used.
+        # Perhaps we can use the dataset_idx instead of the targets. 
+        cached_features = {} # TODO: how to solve this?
         for itr, (sample, target) in enumerate(supervised_loader_train):
             
             def load_imgs():
@@ -436,7 +441,6 @@ def main(args, resume_preempt=False):
                 _new_lr = scheduler.step() 
                 _new_wd = wd_scheduler.step()
                 
-                # Additional allreduce might have considerable negative impact on training speed. See: https://discuss.pytorch.org/t/distributeddataparallel-loss-compute-and-backpropogation/47205/4                    
                 def loss_fn(h, targets):
                     loss = criterion(h, targets)
                     loss = AllReduce.apply(loss).clone()
@@ -447,7 +451,7 @@ def main(args, resume_preempt=False):
                     # Step 1. Forward into the encoder
                     h = target_encoder(imgs) 
 
-                    h_detached = h.detach() # Detaching will prevent autograd from backpropagating the autoencoder gradients to the vision transformer model 
+                    h_detached = h.detach() # Detaching will prevent autograd from backpropagating the gradients from the autoencoder to the vision transformer model 
                     
                     # Step 2. Autoencoder Dimensionality Reduction  
                     reconstructed_input, bottleneck_output = autoencoder(h_detached)                     
@@ -488,13 +492,14 @@ def main(args, resume_preempt=False):
                     k_means_loss = 0
                     k_means_losses = k_means_losses.squeeze(2).transpose(0,1)
                     #print('K-means losses:', k_means_losses.size())
-                    for i in range(batch_size):
+                    size = imgs.size(0) # This allows handling cases when the number of points is different from batch size (due to drop_last=False)
+                    for i in range(size):
                         subclass_loss += subclass_losses[best_k_indexes[i]][i]
                         k_means_loss += k_means_losses[best_k_indexes[i]][i]
 
-                    # Update loss meters                    
-                    subclass_loss /= batch_size
-                    k_means_loss /= batch_size
+                    # Update loss meters (divide by the length of the image batch instead of batch_size)               
+                    subclass_loss /= size
+                    k_means_loss /= size
 
                     subclass_loss = AllReduce.apply(subclass_loss).clone()
                     children_cls_loss_meter.update(subclass_loss)
@@ -523,7 +528,14 @@ def main(args, resume_preempt=False):
                     #print('Subclass loss', subclass_loss)
                     #print('K-means loss', k_means_loss)
                     #print('Autoencoder reconstruction loss', reconstruction_loss)
-
+                    op = True
+                    for key in cached_features_last_epoch:
+                        # When all centroids were initialized
+                        if k_means_module.n_kmeans[key][0].centroids is None:
+                            op = False
+                    if op:
+                        print('M - Step')
+                        k_means_module.update(cached_features_last_epoch, device)
                 # TODO: fix
                 if accum_iter > 1: 
                     loss_value = loss.item()
@@ -604,14 +616,28 @@ def main(args, resume_preempt=False):
                     cache[y].append(x)
                 return cache
             
-            cached_features = update_cache(cached_features) # TODO: Verify if filled at the end of epoch []
+            '''
+                Warning:
+                 Each device will run its own process with its own copy of the main code (including all objects that will be shared).
+                 Because of that, the current epoch's cache will be updated upon different data because of DDP.
+                 With this in mind we have to synchronize the update across all devices such that it is mantained consistent across all of them.
+                 TODO: implement broadcasting solution.
+            '''
+            cached_features = update_cache(cached_features) 
+        # -- End of Epoch            
         cnt = 0
         for key in cached_features.keys():
             cnt += len(cached_features[key])
+        assert cnt == 245897, 'Cache not compatible, corrupted or missing'
         logger.info('No. samples in the cache:', cnt, 'Num. classes:', len(cached_features.keys()))
 
-        # Perform M step on K-means module
-        M_losses = k_means_module.update(cached_features, device)
+        # -- Perform M step on K-means module
+        # TODO: same cache problem happens over here.
+        # Each centroid replica is been updated according to the subset of the dataset
+        # that is being handled from DDP. This means that each centroid will be updated differently if the cache 
+        # is not consistent. 
+        # Good news is that we only have to make the cache consistent in order to make the k-means consistent as well.
+        M_losses = k_means_module.update(cached_features, device) 
         logger.info('Losses after M step: ', M_losses)
 
         cached_features_last_epoch = copy.deepcopy(cached_features)

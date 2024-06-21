@@ -67,13 +67,6 @@ class KMeansModule:
         
     '''
         Assigns a single data point to the set of clusters correspondent to the y target.
-        As faiss prevents us from assigning a single data point, this approach ensures 
-        the data meets the necessary size requirements and prevent us from
-        taking the risk of modifying the library's code. 
-
-        The problem with the assignment step is that in order to compute the cluster assignments we have to have the initialized centroids at first, that is 
-        because k-means generally uses the own data points to provide the locations for the centroids. This is a problem because we need at least n >= k 
-        data points to initialize the centroids and our data comes in batches of size 32 < n < 128. 
 
         Centroid initialization is going to be a problem in the first epoch because we wouldn't have the features cached yet, after that we can use the previous epoch's
         cache to initialize the centroids appropriately. Despite that, initialization is a problem for the first epochs despite of everything. That's because we are 
@@ -89,7 +82,6 @@ class KMeansModule:
         (1) - Replace emtpy centroids by non empty ones with a perturbation.
         (2) - Train K-means after every T epochs e.g., 2 or 3 (this gives the encoders some space to refine their features). 
         (3) - Reset the K-means centroids after every N epochs (couldn't be deterministic)
-
     '''
     def assign(self, x, y, resources, rank, device, cached_features=None):
 
@@ -154,14 +146,16 @@ class KMeansModule:
 
     # TODO: print centroid before and after updating
     def iterative_kmeans(self, xb, k_means_index, device):
+        print('Xb', xb.size())
         D_per_K_value = []
         for itr in range(self.n_iter - 1):  # n_iter-1 because we already did one iteration
             # Update K-Means for each value of K 
             for k in range(len(self.n_kmeans[k_means_index])):
-                print('Updating K-Means for class: ',k_means_index, 'with  K=',k)
+                print('Updating K-Means for class: ',k_means_index, 'with  K=',self.k_range[k])
                 # Assign vectors to the nearest cluster centroid
                 D, I = self.n_kmeans[k_means_index][k].index.search(xb, 1)
                 print('Batch Assignments:', I.size())
+                print(I)
                 new_centroids = []
                 counts = []
                 # Initialize tensors to store new centroids and counts
@@ -170,13 +164,19 @@ class KMeansModule:
 
                 # Sum up all points in each cluster
                 for i in range(len(xb)):
-                    cluster_id = I[i][0] 
+                    print('i', i)
+                    cluster_id = I[i][0]
+                    print('##########')
+                    print('cluster_id', cluster_id) 
+                    print('New centroids shape:', len(new_centroids))
+                    print('New centroids[0] shape:', new_centroids[0].size())
+                    
                     new_centroids[cluster_id] += xb[i] 
                     counts[cluster_id] += 1
 
                 # Compute the mean for each cluster
                 for j in range(k):
-                    # TODO: track no. of empty clusters per epoch.
+                    # TODO: how to track no. of empty clusters per epoch.
                     if counts[j] > 0:
                         new_centroids[j] /= counts[j]
                     #else:
