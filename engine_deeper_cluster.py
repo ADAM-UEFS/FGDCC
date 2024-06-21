@@ -385,7 +385,6 @@ def main(args, resume_preempt=False):
                                              device=device, target_encoder=target_encoder,
                                              autoencoder=autoencoder,
                                              path=root_path+'/DeepCluster/cache')
-    dist.barrier()
     cnt = [len(cached_features_last_epoch[key]) for key in cached_features_last_epoch.keys()]    
     assert sum(cnt) == 245897, 'Cache not compatible, corrupted or missing' # Img qtt before upsampling = 243916
     logger.info('Done.')
@@ -395,6 +394,7 @@ def main(args, resume_preempt=False):
     logger.info('Done.')
     logger.info('M - Step...')
     M_losses = k_means_module.update(cached_features_last_epoch, device) # M-step
+    # dist.barrier()
     print('Losses', M_losses)
     accum_iter = 1
     start_epoch = resume_epoch
@@ -417,13 +417,7 @@ def main(args, resume_preempt=False):
         target_encoder.train(True)
         hierarchical_classifier.train(True)
 
-        # TODO REMINDER: Cached features is indexed by tensors (i.e., (Tensor 123)) which means that it will use
-        # not the tensor value but the tensor id assigned by pytorch.
-        # This note is a reminder in the sense that the first epoch's cache is indexed by integers (class ids) instead.
-        # Also, this is also a debug warning because we have to inspect the other problems that this approach can generate.
-        # That is because tensors with same values have different ids and therefore this kind of index should not be used.
-        # Perhaps we can use the dataset_idx instead of the targets. 
-        cached_features = {} # TODO: how to solve this?
+        cached_features = {}
         for itr, (sample, target) in enumerate(supervised_loader_train):
             
             def load_imgs():
@@ -544,8 +538,6 @@ def main(args, resume_preempt=False):
 
                 #  Step 2. Backward & step
                 if use_bfloat16:
-                    # retain_graph : if False, the graph used to compute the grads will be freed. 
-                    # create_graph : if True, allows to compute multiple order derivatives.
                     scaler(reconstruction_loss, AE_optimizer, clip_grad=1.0,
                                 parameters=autoencoder.parameters(), create_graph=False, retain_graph=False,
                                 update_grad=(itr + 1) % accum_iter == 0)
