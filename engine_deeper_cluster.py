@@ -372,32 +372,32 @@ def main(args, resume_preempt=False):
     # -- Remove from device once they are required for loading pretrained parameters only
     del encoder
     del predictor
-
-    accum_iter = 1
-    start_epoch = resume_epoch
     
-    logger.info('Building cache...')
-    cached_features_last_epoch = build_cache(data_loader=supervised_loader_train,
-                                             device=device, target_encoder=target_encoder,
-                                             autoencoder=autoencoder,
-                                             path=root_path+'/DeepCluster/cache')
-    dist.barrier()
-    cnt = 0
-    for key in cached_features_last_epoch.keys():
-        l = len(cached_features_last_epoch[key])
-        if l < 10:
-            print(key)
-        cnt += l
-    assert cnt == 245897, 'Cache not compatible, corrupted or missing' # Img qtt before upsampling = 243916
-    logger.info('Cache ready')
-    
-    #resources = [faiss.StandardGpuResources() for i in range(world_size)]
     res = faiss.StandardGpuResources()
     cfg = faiss.GpuIndexFlatConfig()
     cfg.device = rank
     
     K_range = [2,3,4,5]
     k_means_module = KMeans.KMeansModule(nb_classes, dimensionality=256, k_range=K_range, resources=res, config=cfg)
+
+    logger.info('Building cache...')
+    cached_features_last_epoch = build_cache(data_loader=supervised_loader_train,
+                                             device=device, target_encoder=target_encoder,
+                                             autoencoder=autoencoder,
+                                             path=root_path+'/DeepCluster/cache')
+    dist.barrier()
+    cnt = [len(cached_features_last_epoch[key]) for key in cached_features_last_epoch.keys()]    
+    assert sum(cnt) == 245897, 'Cache not compatible, corrupted or missing' # Img qtt before upsampling = 243916
+    logger.info('Done.')
+
+    logger.info('Initializing centroids...')
+    k_means_module.init(resources=res, rank=rank, cached_features=cached_features_last_epoch, device=device) # E-step
+    logger.info('Done.')
+    logger.info('M - Step...')
+    M_losses = k_means_module.update(cached_features_last_epoch, device) # M-step
+    print('Losses', M_losses)
+    accum_iter = 1
+    start_epoch = resume_epoch
 
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
@@ -509,7 +509,10 @@ def main(args, resume_preempt=False):
                     
                     reconstruction_loss = AllReduce.apply(reconstruction_loss).clone()
                     reconstruction_loss_meter.update(reconstruction_loss)
-                    reconstruction_loss += 0.25 * k_means_loss # Add K-means distances term as penalty to enforce a "k-means friendly space" 
+                    # Add K-means distances term as penalty to enforce a "k-means friendly space" 
+                    # FIXME: this won't work as expected since its a constant
+                    # TODO: perhaps multiplying by the gradients of the parameters from the ViT encoder.
+                    reconstruction_loss += 0.25 * k_means_loss 
                     '''
                         `all_reduce`: is used to perform an element-wise reduction operation (like sum, product, max, min, etc.) 
                         across all processes in a process group. 
@@ -528,14 +531,6 @@ def main(args, resume_preempt=False):
                     #print('Subclass loss', subclass_loss)
                     #print('K-means loss', k_means_loss)
                     #print('Autoencoder reconstruction loss', reconstruction_loss)
-                    op = True
-                    for key in cached_features_last_epoch:
-                        # When all centroids were initialized
-                        if k_means_module.n_kmeans[key][0].centroids is None:
-                            op = False
-                    if op:
-                        print('M - Step')
-                        k_means_module.update(cached_features_last_epoch, device)
                 # TODO: fix
                 if accum_iter > 1: 
                     loss_value = loss.item()
@@ -607,10 +602,10 @@ def main(args, resume_preempt=False):
                                         grad_stats.min,
                                         grad_stats.max))
             log_stats()
-            bottleneck_output = bottleneck_output.to(device=torch.device('cpu'), dtype=torch.float32) # Verify if apply dist.barrier
-            
+            bottleneck_output = bottleneck_output.to(device=torch.device('cpu'), dtype=torch.float32).detach() # Verify if apply dist.barrier
             def update_cache(cache):
                 for x, y in zip(bottleneck_output, target):
+                    y = y.item()
                     if not y in cache:
                         cache[y] = []                    
                     cache[y].append(x)
@@ -623,13 +618,11 @@ def main(args, resume_preempt=False):
                  With this in mind we have to synchronize the update across all devices such that it is mantained consistent across all of them.
                  TODO: implement broadcasting solution.
             '''
-            cached_features = update_cache(cached_features) 
+            cached_features = update_cache(cached_features)
         # -- End of Epoch            
-        cnt = 0
-        for key in cached_features.keys():
-            cnt += len(cached_features[key])
-        assert cnt == 245897, 'Cache not compatible, corrupted or missing'
-        logger.info('No. samples in the cache:', cnt, 'Num. classes:', len(cached_features.keys()))
+        cnt = [len(cached_features_last_epoch[key]) for key in cached_features_last_epoch.keys()]    
+        assert sum(cnt) == 245897, 'Cache not compatible, corrupted or missing' # Img qtt before upsampling = 243916
+        logger.info('No. samples in the cache:', sum(cnt), 'Num. classes:', len(cached_features.keys()))
 
         # -- Perform M step on K-means module
         # TODO: same cache problem happens over here.
@@ -637,9 +630,9 @@ def main(args, resume_preempt=False):
         # that is being handled from DDP. This means that each centroid will be updated differently if the cache 
         # is not consistent. 
         # Good news is that we only have to make the cache consistent in order to make the k-means consistent as well.
-        M_losses = k_means_module.update(cached_features, device) 
-        logger.info('Losses after M step: ', M_losses)
-
+        M_losses = k_means_module.update(cached_features, device)
+        for k in range(len(K_range)):            
+            logger.info('Average K-Means Loss after M step: [K=',K_range[k],', value:', M_losses[k],']')
         cached_features_last_epoch = copy.deepcopy(cached_features)
 
         testAcc1 = AverageMeter()

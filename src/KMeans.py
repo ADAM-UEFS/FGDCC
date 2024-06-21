@@ -48,7 +48,7 @@ class KMeansModule:
 
     # TODO: nb_classes has to be the class idx_map. 
     # TODO: Verify what pytorch uses. 
-    def __init__(self, nb_classes, dimensionality=256, n_iter=30, k_range=[2,3,4,5], resources=None, config=None, max_iter=300):
+    def __init__(self, nb_classes, dimensionality=256, n_iter=50, tol=1e-4, k_range=[2,3,4,5], resources=None, config=None):
 
         self.resources = resources
         self.config = config        
@@ -56,7 +56,8 @@ class KMeansModule:
         # Create the K-means object
         self.k_range = k_range
         self.d = dimensionality
-        self.n_iter = n_iter
+        self.max_iter = n_iter
+        self.tol = tol
         
         if len(k_range) == 1:
             self.n_kmeans = [faiss.Kmeans(d=dimensionality, k=k_range[0], niter=1, verbose=True, min_points_per_centroid = 1 ) for _ in range(nb_classes)]   
@@ -64,7 +65,41 @@ class KMeansModule:
             self.n_kmeans = []   
             for _ in range(nb_classes):
                 self.n_kmeans.append([faiss.Kmeans(d=dimensionality, k=k, niter=1, verbose=False, min_points_per_centroid = 1) for k in k_range])                                                            
+
+    def initialize_centroids(self, batch_x, class_id, resources, rank, device, cached_features):
+        def augment(x, n_samples): # Built as a helper function for development TODO: remove
+            # Workaround to handle faiss centroid initialization with a single sample.
+            # We built upon Mathilde Caron's idea of adding perturbations to the data, but we do it randomly instead.
+            augmented_data = x.repeat((n_samples, 1))
+            for i in range((n_samples)):
+                sign = (torch.randint(0, 3, size=(self.d,)) - 1)
+                sign = sign.to(device=device, dtype=torch.float32)
+                eps = torch.tensor(1e-7, dtype=torch.float32, device=device)   
+                augmented_data[i] += sign * eps                
+            return augmented_data 
         
+        if cached_features is None:
+            batch_x = augment(batch_x, self.k_range[len(self.k_range)-1]) # Create additional synthetic points to meet the minimum requirement for the number of clusters.             
+        else:
+            image_list = cached_features[class_id] # Otherwise use the features cached from the previous epoch                
+            batch_x = torch.stack(image_list)
+        for k in range(len(self.k_range)):
+            self.n_kmeans[class_id][k].train(batch_x.detach().cpu()) # Then train K-means model for one iteration to initialize centroids
+            # Replace the regular index by a gpu one
+            index_flat = self.n_kmeans[class_id][k].index
+            gpu_index_flat = faiss.index_cpu_to_gpu(resources, rank, index_flat)
+            self.n_kmeans[class_id][k].index = gpu_index_flat
+    
+    def init(self, resources, rank, device, cached_features):
+        # Initialize the centroids for each class
+        for key in cached_features.keys():
+            self.initialize_centroids(batch_x=None,
+                                      class_id=key,
+                                      resources=resources,
+                                      rank=rank,
+                                      device=device,
+                                      cached_features=cached_features)             
+             
     '''
         Assigns a single data point to the set of clusters correspondent to the y target.
 
@@ -84,31 +119,6 @@ class KMeansModule:
         (3) - Reset the K-means centroids after every N epochs (couldn't be deterministic)
     '''
     def assign(self, x, y, resources, rank, device, cached_features=None):
-
-        def augment(x, n_samples):
-            # Workaround to handle faiss centroid initialization with a single sample.
-            # We built upon Mathilde Caron's idea of adding perturbations to the data, but we do it randomly instead.
-            augmented_data = x.repeat((n_samples, 1))
-            for i in range((n_samples)):
-                sign = (torch.randint(0, 3, size=(self.d,)) - 1)
-                sign = sign.to(device=device, dtype=torch.float32)
-                eps = torch.tensor(1e-7, dtype=torch.float32, device=device)   
-                augmented_data[i] += sign * eps                
-            return augmented_data 
-
-        def initialize_centroids(batch_x, class_id):
-            if cached_features is None:
-                batch_x = augment(batch_x, self.k_range[len(self.k_range)-1]) # Create additional synthetic points to meet the minimum requirement for the number of clusters.             
-            else:
-                image_list = cached_features[class_id] # Otherwise use the features cached from the previous epoch                
-                batch_x = torch.stack(image_list)
-            for k in range(len(self.k_range)):
-                self.n_kmeans[class_id][k].train(batch_x.detach().cpu()) # Then train K-means model for one iteration to initialize centroids
-                # Replace the regular index by a gpu one
-                index_flat = self.n_kmeans[class_id][k].index
-                gpu_index_flat = faiss.index_cpu_to_gpu(resources, rank, index_flat)
-                self.n_kmeans[class_id][k].index = gpu_index_flat
-
         D_batch = []
         I_batch = []        
         for i in range(len(x)):
@@ -116,7 +126,8 @@ class KMeansModule:
             batch_x = x[i].unsqueeze(0)
             # Initialize the centroids if it haven't already been initialized
             if self.n_kmeans[y[i]][0].centroids is None:
-                initialize_centroids(batch_x, y[i].item())
+                # FIXME this won't work inside the training loop because inside it batch_x is not on cpu but since this isn't expected to be called should be safe for now
+                self.initialize_centroids(batch_x, y[i].item(), resources, rank, device, cached_features)                
             # Assign the vectors to the nearest centroid
             D_k, I_k = [], []
             for k in range(len(self.k_range)):
@@ -125,6 +136,7 @@ class KMeansModule:
                 I_k.append(I[0])            
             D_batch.append(torch.stack(D_k))
             I_batch.append(torch.stack(I_k))
+
         D_batch = torch.stack((D_batch))
         I_batch = torch.stack((I_batch))
         return D_batch, I_batch
@@ -132,55 +144,63 @@ class KMeansModule:
     def update(self, cached_features, device):
         means = [[] for k in self.k_range]
         for key in cached_features.keys():
-            xb = torch.stack(cached_features[key])
+            xb = torch.stack(cached_features[key]) # Form an image batch
+            if xb.get_device() == -1:
+                xb = xb.to(device, dtype=torch.float32)
             _, batch_k_means_loss = self.iterative_kmeans(xb, key, device) # TODO: sum and average across dataset length
             # log_loss.update(batch_k_means_loss.mean())
+            # For each "batch" append the losses (average distances) for each K value.
             for k in range(len(self.k_range)):
-                means[k].append(batch_k_means_loss[k].mean())
-            #print('K-Means losses per K value', batch_k_means_loss.size())
+                means[k].append(batch_k_means_loss[k])
+        # Compute the average loss for each value of K in k_range across all data points 
         losses = []
         for k in range(len(self.k_range)):
             stack = torch.stack(means[k])
             losses.append(stack.mean())
         return losses
 
-    # TODO: print centroid before and after updating
-    def iterative_kmeans(self, xb, k_means_index, device):
-        print('Xb', xb.size())
-        D_per_K_value = []
-        for itr in range(self.n_iter - 1):  # n_iter-1 because we already did one iteration
-            # Update K-Means for each value of K 
-            for k in range(len(self.n_kmeans[k_means_index])):
-                print('Updating K-Means for class: ',k_means_index, 'with  K=',self.k_range[k])
-                # Assign vectors to the nearest cluster centroid
-                D, I = self.n_kmeans[k_means_index][k].index.search(xb, 1)
-                print('Batch Assignments:', I.size())
-                print(I)
+    '''
+
+        TODO Create metric loggers to account for the stats:
+            - Track the average no. of iterations to converge per class and per K.
+            - Track the average no. empty clusters per class and per K.
+    '''
+    def iterative_kmeans(self, xb, class_index, device):
+        D_per_K_value = torch.zeros(len(self.k_range)) # e.g., [2, 3, 4, 5]
+        for k in range(len(self.k_range)):
+            K = self.k_range[k]
+            previous_inertia = 0
+            for itr in range(self.max_iter - 1):  # n_iter-1 because we already did one iteration    
+                # Compute the assignments
+                D, I = self.n_kmeans[class_index][k].index.search(xb, 1)
+            
+                inertia = torch.sum(D)
+                if not previous_inertia == 0 and abs(previous_inertia - inertia) < self.tol:
+                    D_per_K_value[k] = torch.mean(D)
+                    break
+                previous_inertia = inertia
+
                 new_centroids = []
                 counts = []
+                
                 # Initialize tensors to store new centroids and counts
-                new_centroids.append(torch.zeros((k, self.d), dtype=torch.float32, device=device))
-                counts.append(torch.zeros(k, dtype=torch.int64, device=device))
+                new_centroids = torch.zeros((K, self.d), dtype=torch.float32, device=device)
+                counts = torch.zeros(K, dtype=torch.int64, device=device)
 
                 # Sum up all points in each cluster
                 for i in range(len(xb)):
-                    print('i', i)
-                    cluster_id = I[i][0]
-                    print('##########')
-                    print('cluster_id', cluster_id) 
-                    print('New centroids shape:', len(new_centroids))
-                    print('New centroids[0] shape:', new_centroids[0].size())
-                    
+                    cluster_id = I[i][0].item()
                     new_centroids[cluster_id] += xb[i] 
                     counts[cluster_id] += 1
 
                 # Compute the mean for each cluster
-                for j in range(k):
+                for j in range(K):
                     # TODO: how to track no. of empty clusters per epoch.
                     if counts[j] > 0:
                         new_centroids[j] /= counts[j]
                     #else:
                         #print('Deal with empty clusters')
+                        #mask = local_counts.nonzero()
                         # choose a random cluster from the set of non empty clusters
                         #np.random.seed(world_id)
                         #m = mask[np.random.randint(len(mask))]
@@ -206,12 +226,8 @@ class KMeansModule:
                 #new_centroids_np = new_centroids.cpu().numpy()
 
                 # Update the centroids in the FAISS index
-                self.n_kmeans[k_means_index].centroids = new_centroids
-                self.n_kmeans[k_means_index].index.reset()
-                self.n_kmeans[k_means_index].index.add(new_centroids)
-                if itr == (self.n_iter - 1) - 1:
-                    D_per_K_value.append(D)
-        D_per_K_value = torch.stack(D_per_K_value)
-            
-        # TODO: Verify the shape of D, and whether we should return the final value or its mean across the iterations. 
+                self.n_kmeans[class_index][k].centroids = new_centroids
+                self.n_kmeans[class_index][k].index.reset()
+                self.n_kmeans[class_index][k].index.add(new_centroids)    
+                D_per_K_value[k] = torch.mean(D)
         return self.n_kmeans, D_per_K_value
