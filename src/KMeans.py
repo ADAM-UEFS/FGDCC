@@ -225,22 +225,35 @@ class KMeansModule:
                         new_centroids[j] /= counts[j]
                         non_empty.append((k,j))
                     else:
-                        if len(non_empty) > 0:
+                        sign = (torch.randint(0, 3, size=(self.d,), device=device) - 1)
+                        eps = torch.tensor(1e-7, dtype=torch.float32, device=device)   
+                        op = sign * eps 
+                        if len(non_empty) > 0:                        
                             if len(non_empty) > 1:
-                                idx = np.random.randint(0, len(non_empty) - 1) 
+                                idx = np.random.randint(0, len(non_empty)) 
                             else:
                                 idx = 0
                             cluster_id = non_empty[idx][1] # choose a random cluster from the set of non empty clusters
                             non_empty_cluster = new_centroids[cluster_id]
                             new_centroids[j] = torch.clone(non_empty_cluster)
-                            sign = (torch.randint(0, 3, size=(self.d,)) - 1)
-                            sign = sign.to(device=device, dtype=torch.float32)
-                            eps = torch.tensor(1e-7, dtype=torch.float32, device=device)   
-                            new_centroids[j] += sign * eps # replace empty centroid by a non empty one with a perturbation
-                            non_empty_cluster[j] -= sign * eps                            
+                            # Replace empty centroid by a non empty one with a perturbation
+                            new_centroids[j] += op 
+                            non_empty_cluster -= op
                             non_empty.append((k,j))
                             empty_clusters.append(K)
-                        
+                        else:
+                            # If the first centroid is empty, select one randomly hoping that it is not empty. 
+                            if ((j+1) <  (K-1)):
+                                idx = np.random.randint(j+1, K)
+                            else:
+                                idx = j+1
+                            non_empty_cluster = self.n_kmeans[class_index][k].centroids[idx]
+                            new_centroids[j] = torch.clone(non_empty_cluster)
+                            # Replace empty centroid by a possibly non-empty one with a perturbation
+                            new_centroids[j] += op 
+                            non_empty_cluster -= op
+                            non_empty.append((k,j))
+                            empty_clusters.append(K)                        
                 # Update the centroids in the FAISS index
                 self.n_kmeans[class_index][k].centroids = new_centroids
                 self.n_kmeans[class_index][k].index.reset()
