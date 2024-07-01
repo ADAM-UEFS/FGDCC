@@ -43,14 +43,14 @@ def load_checkpoint(
         epoch = checkpoint['epoch']
 
         # -- loading encoder
-        pretrained_dict = checkpoint['encoder']
-        msg = encoder.load_state_dict(pretrained_dict)
-        logger.info(f'loaded pretrained encoder from epoch {epoch} with msg: {msg}')
+        #pretrained_dict = checkpoint['encoder']
+        #msg = encoder.load_state_dict(pretrained_dict)
+        #logger.info(f'loaded pretrained encoder from epoch {epoch} with msg: {msg}')
 
         # -- loading predictor
-        pretrained_dict = checkpoint['predictor']
-        msg = predictor.load_state_dict(pretrained_dict)
-        logger.info(f'loaded pretrained encoder from epoch {epoch} with msg: {msg}')
+        #pretrained_dict = checkpoint['predictor']
+        #msg = predictor.load_state_dict(pretrained_dict)
+        #logger.info(f'loaded pretrained encoder from epoch {epoch} with msg: {msg}')
 
         # -- loading target_encoder
         if target_encoder is not None:
@@ -60,11 +60,11 @@ def load_checkpoint(
             logger.info(f'loaded pretrained encoder from epoch {epoch} with msg: {msg}')
 
         # -- loading optimizer
-        opt.load_state_dict(checkpoint['opt'])
-        if scaler is not None:
-            scaler.load_state_dict(checkpoint['scaler'])
-        logger.info(f'loaded optimizers from epoch {epoch}')
-        logger.info(f'read-path: {r_path}')
+        #opt.load_state_dict(checkpoint['opt'])
+        #if scaler is not None:
+        #    scaler.load_state_dict(checkpoint['scaler'])
+        #logger.info(f'loaded optimizers from epoch {epoch}')
+        #logger.info(f'read-path: {r_path}')
         del checkpoint
 
     except Exception as e:
@@ -77,10 +77,14 @@ def load_DC_checkpoint(
     device,
     r_path,
     target_encoder,
+    hierarchical_classifier,
+    autoencoder,
     opt,
+    AE_optimizer,
     scaler,
-    scaler2
+    scaler2=None
 ):
+
     try:
         checkpoint = torch.load(r_path, map_location=torch.device('cpu'))
         epoch = checkpoint['epoch']
@@ -91,9 +95,19 @@ def load_DC_checkpoint(
             pretrained_dict = checkpoint['target_encoder']
             msg = target_encoder.load_state_dict(pretrained_dict)
             logger.info(f'loaded pretrained encoder from epoch {epoch} with msg: {msg}')
+        if hierarchical_classifier is not None:
+            pretrained_dict = checkpoint['classification_head']
+            msg = hierarchical_classifier.load_state_dict(pretrained_dict)
+            logger.info(f'loaded pretrained classifier from epoch {epoch} with msg: {msg}')
+        if autoencoder is not None:
+            pretrained_dict = checkpoint['autoencoder']
+            msg = autoencoder.load_state_dict(pretrained_dict)
+            logger.info(f'loaded pretrained autoencoder from epoch {epoch} with msg: {msg}')
 
         # -- loading optimizer
         opt.load_state_dict(checkpoint['opt'])
+        if AE_optimizer is not None:
+            AE_optimizer.load_state_dict(checkpoint['opt'])
         if scaler is not None:
             scaler.load_state_dict(checkpoint['scaler'])
         logger.info(f'loaded optimizers from epoch {epoch}')
@@ -104,7 +118,7 @@ def load_DC_checkpoint(
         logger.info(f'Encountered exception when loading checkpoint {e}')
         epoch = 0
 
-    return target_encoder, opt, scaler, epoch
+    return target_encoder, hierarchical_classifier, None, opt, None, scaler, epoch
 
 
 class ParentClassifier(nn.Module):

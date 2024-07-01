@@ -26,6 +26,7 @@ import numpy as np
 
 import torch
 import torch.multiprocessing as mp
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 
@@ -55,7 +56,6 @@ from src.helper import (
     )
 from src.transforms import make_transforms
 import time
-import torch.distributed as dist
 
 # --BROUGHT fRoM MAE
 from timm.data.mixup import Mixup
@@ -202,6 +202,7 @@ def main(args, resume_preempt=False):
         pred_emb_dim=pred_emb_dim,
         model_name=model_name)
     target_encoder = copy.deepcopy(encoder)
+    target_encoder = DistributedDataParallel(target_encoder, static_graph=True) # Wrap around ddp to make state dict compatible
 
     logger.info(autoencoder)
 
@@ -295,12 +296,6 @@ def main(args, resume_preempt=False):
 
     CEL_no_reduction = torch.nn.CrossEntropyLoss(reduction='none')
 
-    # -- # -- # -- #
-    encoder = DistributedDataParallel(encoder, static_graph=True)
-    predictor = DistributedDataParallel(predictor, static_graph=True)
-    target_encoder = DistributedDataParallel(target_encoder, static_graph=True)
-    autoencoder = DistributedDataParallel(autoencoder, static_graph=True)
-
     # -- Load ImageNet weights
     if resume_epoch == 0:    
         encoder, predictor, target_encoder, optimizer, scaler, start_epoch = load_checkpoint(
@@ -311,14 +306,23 @@ def main(args, resume_preempt=False):
             target_encoder=target_encoder,
             opt=optimizer,
             scaler=scaler)
+        
+    del encoder
+    del predictor
     
     def save_checkpoint(epoch):
         save_dict = {
             'target_encoder': target_encoder.state_dict(),
-            'opt': optimizer.state_dict(),
+            'classification_head': hierarchical_classifier.state_dict(),
+            'opt_1': optimizer.state_dict(),
+            'opt_2': AE_optimizer.state_dict(),
             'scaler': None if scaler is None else scaler.state_dict(),
             'epoch': epoch,
-            'loss': loss_meter.avg,
+            'loss': total_loss_meter.avg,
+            'parent_loss': parent_cls_loss_meter.avg,
+            'subclass_loss': children_cls_loss_meter.avg,
+            'reconstruction_loss': reconstruction_loss_meter.avg,
+            'k_means_loss': k_means_loss_meter.avg,
             'batch_size': batch_size,
             'world_size': world_size,
             'lr': lr
@@ -328,12 +332,18 @@ def main(args, resume_preempt=False):
             if (epoch + 1) % checkpoint_freq == 0:
                 torch.save(save_dict, save_path.format(epoch=f'{epoch + 1}'))
 
-    target_encoder = target_encoder.module # Unwrap from DDP    
+    #n_blocks = 12
+    #total_blocks = len(target_encoder.module.blocks)
+    #for i in range((total_blocks - n_blocks), total_blocks):
+    #    for p in target_encoder.module.blocks[i].parameters():
+    #        p.requires_grad = True
+    
     for p in target_encoder.parameters():
         p.requires_grad = True
+    target_encoder = target_encoder.module 
 
     target_encoder = configure_finetuning(target_encoder, nb_classes=nb_classes, drop_path=drop_path, device=device)
-    hierarchical_classifier = get_classification_head(target_encoder.pretrained_model.embed_dim, nb_classes=nb_classes, drop_path=drop_path, K_range=[2,3,4,5] ,device=device)
+    hierarchical_classifier = get_classification_head(target_encoder.pretrained_model.embed_dim, nb_classes=nb_classes, drop_path=drop_path, K_range=[2,3,4,5] , device=device)
     
     # -- Override previously loaded optimization configs.
     # Create one optimizer that takes into account both encoder and its classifier parameters.
@@ -352,6 +362,7 @@ def main(args, resume_preempt=False):
         ipe_scale=ipe_scale,
         use_bfloat16=use_bfloat16)
     
+    autoencoder = DistributedDataParallel(autoencoder, static_graph=True)
     target_encoder = DistributedDataParallel(target_encoder, static_graph=True) # Static Graph: the set of used and unused parameters will not change during the whole training loop.    
     hierarchical_classifier = DistributedDataParallel(hierarchical_classifier, static_graph=False, find_unused_parameters=True) # Static Graph: the set of used and unused parameters will not change during the whole training loop.
     
@@ -369,16 +380,20 @@ def main(args, resume_preempt=False):
 
     logger.info(target_encoder)
 
-    # -- Remove from device once they are required for loading pretrained parameters only
-    del encoder
-    del predictor
+    resources = faiss.StandardGpuResources()
+    config = faiss.GpuIndexFlatConfig()
+    config.device = rank
     
-    res = faiss.StandardGpuResources()
-    cfg = faiss.GpuIndexFlatConfig()
-    cfg.device = rank
+    #resources = [faiss.StandardGpuResources() for _ in range(world_size)]
+    #configs = [faiss.GpuIndexFlatConfig() for _ in range(world_size)]
     
+    #configs[rank] = faiss.GpuIndexFlatConfig()
+    #configs[rank].device = rank
+    #configs[rank].useFloat16 = False
+
     K_range = [2,3,4,5]
-    k_means_module = KMeans.KMeansModule(nb_classes, dimensionality=256, k_range=K_range, resources=res, config=cfg)
+    k_means_module = KMeans.KMeansModule(nb_classes, dimensionality=384, k_range=K_range, resources=resources, config=config)
+    #k_means_module = KMeans.KMeansModule(nb_classes, dimensionality=256, k_range=K_range, resources=resources, config=configs)
 
     logger.info('Building cache...')
     cached_features_last_epoch = build_cache(data_loader=supervised_loader_train,
@@ -388,14 +403,13 @@ def main(args, resume_preempt=False):
     cnt = [len(cached_features_last_epoch[key]) for key in cached_features_last_epoch.keys()]    
     assert sum(cnt) == 245897, 'Cache not compatible, corrupted or missing' # Img qtt before upsampling = 243916
     logger.info('Done.')
-
     logger.info('Initializing centroids...')
-    k_means_module.init(resources=res, rank=rank, cached_features=cached_features_last_epoch, device=device) # E-step
+    k_means_module.init(resources=resources, rank=rank, cached_features=cached_features_last_epoch, config=config, device=device) # E-step
     logger.info('Done.')
     logger.info('M - Step...')
     M_losses = k_means_module.update(cached_features_last_epoch, device) # M-step
-    # dist.barrier()
     print('Losses', M_losses)
+    
     accum_iter = 1
     start_epoch = resume_epoch
 
@@ -454,7 +468,7 @@ def main(args, resume_preempt=False):
 
                     # Step 3. Compute K-Means assignments with disabled autocast as faiss requires float32
                     with torch.cuda.amp.autocast(enabled=False): 
-                        k_means_losses, k_means_assignments = k_means_module.assign(x=bottleneck_output, y=target, resources=res, rank=rank, device=device, cached_features=cached_features_last_epoch)  
+                        k_means_losses, k_means_assignments = k_means_module.assign(x=bottleneck_output, y=target, resources=resources, rank=rank, device=device, cached_features=cached_features_last_epoch)  
 
                     #print('K-Means losses:', k_means_losses.size())
                     #print('Targets format:', target.size())
@@ -611,20 +625,49 @@ def main(args, resume_preempt=False):
                  TODO: implement broadcasting solution.
             '''
             cached_features = update_cache(cached_features)
-        # -- End of Epoch            
-        cnt = [len(cached_features_last_epoch[key]) for key in cached_features_last_epoch.keys()]    
-        assert sum(cnt) == 245897, 'Cache not compatible, corrupted or missing' # Img qtt before upsampling = 243916
-        logger.info('No. samples in the cache:', sum(cnt), 'Num. classes:', len(cached_features.keys()))
+        # -- End of Epoch      
 
-        # -- Perform M step on K-means module
+        if world_size > 1:
+            # Convert cache to list format for gathering
+            cache_list = [(key, torch.stack(value)) for key, value in cached_features.items()]
+
+            # Gather cache lists from all processes
+            all_cache_lists = [None for _ in range(world_size)]
+            dist.all_gather_object(all_cache_lists, cache_list) 
+
+            if rank == 0:
+                aggregated_cache = {}
+                for cache_list in all_cache_lists:
+                    for key, tensor_list in cache_list:
+                        if key not in aggregated_cache:
+                            aggregated_cache[key] = []
+                        aggregated_cache[key].extend(tensor_list)
+
+                # Convert aggregated_cache back to the dictionary format
+                aggregated_cache = {key: torch.cat(tensor_list, dim=0) for key, tensor_list in aggregated_cache.items()}
+            else:
+                aggregated_cache = None
+
+            # Broadcast the aggregated cache from the root process to all other processes
+            aggregated_cache = torch.distributed.broadcast_object_list(aggregated_cache, src=0)
+            cached_features = {key: torch.tensor(value) for key, value in aggregated_cache}
+        
+        logger.info('Asserting cache length')
+        # Assert everything went fine
+        cnt = [len(cached_features[key]) for key in cached_features.keys()]    
+        assert sum(cnt) == 245897, 'Cache not compatible, corrupted or missing'
+        #logger.info('No. samples in the cache:', (sum(cnt)), 'Num. classes:', len(cached_features.keys()))
+
         # TODO: same cache problem happens over here.
         # Each centroid replica is been updated according to the subset of the dataset
         # that is being handled from DDP. This means that each centroid will be updated differently if the cache 
         # is not consistent. 
         # Good news is that we only have to make the cache consistent in order to make the k-means consistent as well.
+        
+        # -- Perform M step on K-means module
         M_losses = k_means_module.update(cached_features, device)
-        for k in range(len(K_range)):            
-            logger.info('Average K-Means Loss after M step: [K=',K_range[k],', value:', M_losses[k],']')
+        #for k in range(len(K_range)):            
+        #    logger.info('Average K-Means Loss after M step: [K=',K_range[k],', value:', M_losses[k],']')
         cached_features_last_epoch = copy.deepcopy(cached_features)
 
         testAcc1 = AverageMeter()
@@ -650,7 +693,7 @@ def main(args, resume_preempt=False):
                     parent_logits, _ = hierarchical_classifier(output, device)                    
                     loss = crossentropy(parent_logits, labels)
                 
-                acc1, acc5 = accuracy(output, labels, topk=(1, 5))
+                acc1, acc5 = accuracy(parent_logits, labels, topk=(1, 5))
 
                 testAcc1.update(acc1)
                 testAcc5.update(acc5)

@@ -21,11 +21,14 @@ from torchvision import datasets, transforms
 
 from timm.data import create_transform
 
-def build_dataset(is_train, image_folder):
+def build_dataset(is_train, test, image_folder):
     transform = build_transform(is_train)
-    root = os.path.join(image_folder, 'train' if is_train else 'val')
+    if not test:
+        root = os.path.join(image_folder, 'train' if is_train else 'val')
+    else:
+        root = os.path.join(image_folder, 'test')
+        logger.info('Test dataset created @%s' %root)
     dataset = datasets.ImageFolder(root, transform=transform)
-
     return dataset
 
 def build_transform(is_train):
@@ -81,6 +84,7 @@ def make_GenericDataset(
     root_path=None,
     image_folder=None,
     training=True,
+    test=False,
     copy_data=False,
     drop_last=True,
     feature_extraction=False,
@@ -89,11 +93,11 @@ def make_GenericDataset(
     
     index_targets = False 
     
-    dataset = build_dataset(is_train=training, image_folder=image_folder)
+    dataset = build_dataset(is_train=training, test=test, image_folder=image_folder)
 
     #print(dataset.class_to_idx) 
-
-    logger.info('Finetuning dataset created')
+    if not test:
+        logger.info('Finetuning dataset created')
 
     dist_sampler = torch.utils.data.distributed.DistributedSampler(
         dataset=dataset,

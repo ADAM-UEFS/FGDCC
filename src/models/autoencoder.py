@@ -12,16 +12,16 @@ class AutoEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(1024, 768),
             nn.GELU(),
-            nn.Linear(768, 512),
+            nn.Linear(768, 384),
             nn.GELU(),
-            nn.Linear(512, 256),
-            nn.GELU(),
+            #nn.Linear(512, 256),
+            #nn.GELU(),
         )
 
         self.decoder = torch.nn.Sequential(
-            torch.nn.Linear(256, 512),
-            nn.GELU(),
-            torch.nn.Linear(512, 768),
+            #torch.nn.Linear(256, 512),
+            #nn.GELU(),
+            torch.nn.Linear(384, 768),
             nn.GELU(),
             torch.nn.Linear(768, 1024),
             nn.GELU(),

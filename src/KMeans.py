@@ -1,9 +1,12 @@
 import torch
+import torch.distributed as dist
 
 import faiss
 import faiss.contrib.torch_utils
 
-import torch.distributed as dist
+import numpy as np
+np.random.seed(0) # TODO: modify
+
 
 '''
     Things to consider...
@@ -46,19 +49,17 @@ import torch.distributed as dist
 '''
 class KMeansModule:
 
-    # TODO: nb_classes has to be the class idx_map. 
-    # TODO: Verify what pytorch uses. 
-    def __init__(self, nb_classes, dimensionality=256, n_iter=50, tol=1e-4, k_range=[2,3,4,5], resources=None, config=None):
-
-        self.resources = resources
-        self.config = config        
+    def __init__(self, nb_classes, dimensionality=256, n_iter=300, tol=1e-4, k_range=[2,3,4,5], resources=None, config=None):
         
-        # Create the K-means object
+        self.resources = resources
+        self.config = config
+
         self.k_range = k_range
         self.d = dimensionality
         self.max_iter = n_iter
         self.tol = tol
         
+        # Create the K-means object
         if len(k_range) == 1:
             self.n_kmeans = [faiss.Kmeans(d=dimensionality, k=k_range[0], niter=1, verbose=True, min_points_per_centroid = 1 ) for _ in range(nb_classes)]   
         else:
@@ -66,7 +67,20 @@ class KMeansModule:
             for _ in range(nb_classes):
                 self.n_kmeans.append([faiss.Kmeans(d=dimensionality, k=k, niter=1, verbose=False, min_points_per_centroid = 1) for k in k_range])                                                            
 
-    def initialize_centroids(self, batch_x, class_id, resources, rank, device, cached_features):
+
+    def my_index_cpu_to_gpu_multiple(self, resources, index, co=None, gpu_nos=None):
+        vres = faiss.GpuResourcesVector()
+        vdev = faiss.IntVector()
+        if gpu_nos is None: 
+            gpu_nos = range(len(resources))
+        for i, res in zip(gpu_nos, resources):
+            vdev.push_back(i)
+            vres.push_back(res)
+        index = faiss.index_cpu_to_gpu_multiple(vres, vdev, index, co)
+        index.referenced_objects = resources
+        return index
+    
+    def initialize_centroids(self, batch_x, class_id, resources, rank, device, config, cached_features):
         def augment(x, n_samples): # Built as a helper function for development TODO: remove
             # Workaround to handle faiss centroid initialization with a single sample.
             # We built upon Mathilde Caron's idea of adding perturbations to the data, but we do it randomly instead.
@@ -79,18 +93,27 @@ class KMeansModule:
             return augmented_data 
         
         if cached_features is None:
+            print('Augment shouldnt be used, exitting...')
+            exit(0)
             batch_x = augment(batch_x, self.k_range[len(self.k_range)-1]) # Create additional synthetic points to meet the minimum requirement for the number of clusters.             
         else:
             image_list = cached_features[class_id] # Otherwise use the features cached from the previous epoch                
             batch_x = torch.stack(image_list)
         for k in range(len(self.k_range)):
             self.n_kmeans[class_id][k].train(batch_x.detach().cpu()) # Then train K-means model for one iteration to initialize centroids
-            # Replace the regular index by a gpu one
+
+            #gpu_index_flat = faiss.GpuIndexFlatL2(resources, self.d, config)
+            #gpu_index_flat = faiss.index_cpu_to_gpu_multiple(resources, devices=[rank],index=index_flat)
+            #gpu_index_flat = faiss.GpuIndexFlatL2(resources[rank], self.d, config[rank])
+            #gpu_index_flat = self.my_index_cpu_to_gpu_multiple(resources, index_flat, gpu_nos=[0,1,2,3,4,5,6,7])
+            
+            # Replace the regular index by a gpu one            
             index_flat = self.n_kmeans[class_id][k].index
-            gpu_index_flat = faiss.index_cpu_to_gpu(resources, rank, index_flat)
+            gpu_index_flat = faiss.index_cpu_to_gpu(self.resources, rank, index_flat)
             self.n_kmeans[class_id][k].index = gpu_index_flat
+            
     
-    def init(self, resources, rank, device, cached_features):
+    def init(self, resources, rank, device, config, cached_features):
         # Initialize the centroids for each class
         for key in cached_features.keys():
             self.initialize_centroids(batch_x=None,
@@ -98,8 +121,8 @@ class KMeansModule:
                                       resources=resources,
                                       rank=rank,
                                       device=device,
+                                      config=config,
                                       cached_features=cached_features)             
-             
     '''
         Assigns a single data point to the set of clusters correspondent to the y target.
 
@@ -166,11 +189,14 @@ class KMeansModule:
             - Track the average no. empty clusters per class and per K.
     '''
     def iterative_kmeans(self, xb, class_index, device):
+        empty_clusters = []
         D_per_K_value = torch.zeros(len(self.k_range)) # e.g., [2, 3, 4, 5]
         for k in range(len(self.k_range)):
             K = self.k_range[k]
             previous_inertia = 0
-            for itr in range(self.max_iter - 1):  # n_iter-1 because we already did one iteration    
+            non_empty = []
+            # n_iter-1 because we already did one iteration    
+            for itr in range(self.max_iter - 1):  
                 # Compute the assignments
                 D, I = self.n_kmeans[class_index][k].index.search(xb, 1)
             
@@ -195,39 +221,33 @@ class KMeansModule:
 
                 # Compute the mean for each cluster
                 for j in range(K):
-                    # TODO: how to track no. of empty clusters per epoch.
                     if counts[j] > 0:
                         new_centroids[j] /= counts[j]
-                    #else:
-                        #print('Deal with empty clusters')
-                        #mask = local_counts.nonzero()
-                        # choose a random cluster from the set of non empty clusters
-                        #np.random.seed(world_id)
-                        #m = mask[np.random.randint(len(mask))]
-
-                        # replace empty centroid by a non empty one with a perturbation
-                        #centroids[k] = centroids[m]
-                        #for j in range(args.dim_pca):
-                            #sign = (j % 2) * 2 - 1;
-                            #centroids[k, j] += sign * 1e-7;
-                            #centroids[m, j] -= sign * 1e-7;
-
-                        # update the counts
-                        #local_counts[k] = local_counts[m] // 2;
-                        #local_counts[m] -= local_counts[k];
-
-                        # update the assignments
-                        #assignments[np.where(assignments == m.item())[0][: int(local_counts[m])]] = k.cpu()
-                        #logger.info('cluster {} empty => split cluster {}'.format(k, m))
-
-                    #logger.info(' # Pass[{0}]\tTime {1:.3f}\tLoss {2:.4f}'.format(p, time.time() - start_pass, log_loss.avg)) 
-                               
-                # Convert PyTorch tensor to NumPy array
-                #new_centroids_np = new_centroids.cpu().numpy()
-
+                        non_empty.append((k,j))
+                    else:
+                        if len(non_empty) > 0:
+                            if len(non_empty) > 1:
+                                idx = np.random.randint(0, len(non_empty) - 1) 
+                            else:
+                                idx = 0
+                            cluster_id = non_empty[idx][1] # choose a random cluster from the set of non empty clusters
+                            non_empty_cluster = new_centroids[cluster_id]
+                            new_centroids[j] = torch.clone(non_empty_cluster)
+                            sign = (torch.randint(0, 3, size=(self.d,)) - 1)
+                            sign = sign.to(device=device, dtype=torch.float32)
+                            eps = torch.tensor(1e-7, dtype=torch.float32, device=device)   
+                            new_centroids[j] += sign * eps # replace empty centroid by a non empty one with a perturbation
+                            non_empty_cluster[j] -= sign * eps                            
+                            non_empty.append((k,j))
+                            empty_clusters.append(K)
+                        
                 # Update the centroids in the FAISS index
                 self.n_kmeans[class_index][k].centroids = new_centroids
                 self.n_kmeans[class_index][k].index.reset()
                 self.n_kmeans[class_index][k].index.add(new_centroids)    
                 D_per_K_value[k] = torch.mean(D)
+        if len(empty_clusters) > 0:
+            print('Empty Clusters for class id:', class_index)
+            print(empty_clusters)
+            print('################# ################# #################')
         return self.n_kmeans, D_per_K_value
