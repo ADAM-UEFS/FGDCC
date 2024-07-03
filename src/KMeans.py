@@ -9,43 +9,13 @@ np.random.seed(0) # TODO: modify
 
 
 '''
-    Things to consider...
-    Two stages are going to have to be considered in this approach: (1) - Dataset iteration and (2) - End of epoch.
-    --
-        (1) - During the dataset iteration we will assign images to the nearest centroid to the cluster
-        correspondent to the class that an image belongs to. 
-        
-        This also mean that we'd probably lose batch speedup due to performing assignment according to each image label
-        on the batch.
-
-        (2) - On the end of an epoch we will perform the update step until convergence.
-
-            To do this we will therefore have to cache the features compressed by the autoencoder. 
-            There is also concernings on how to implement this in a distributed way, and other things that
-            we should have to test in order to check if this could work somehow.
-
-            For example, there may be problems with initializing an array of faiss.Kmeans objects, considering the info below: 
-
-                - "All GPU indexes are built with a StandardGpuResources object (which is an implementation of the abstract class GpuResources). 
-                The resource object contains needed resources for each GPU in use, including an allocation of temporary scratch space 
-                (by default, about 2 GB on a 12 GB GPU), cuBLAS handles and CUDA streams." 
-
-                See: https://github.com/facebookresearch/faiss/wiki/Faiss-on-the-GPU?fbclid=IwZXh0bgNhZW0CMTAAAR3Sfc4jQp3RZEUKUdAOsXcfc0OlhlLlKl2kxPQJG-pc8B71FPL7YBHqQRg_aem_AYSDKlDdlVDpSNmVp-hKCajFVRnw_n2S-OiYzkGBvRxNHJJi-PsdO4CKw0EoF4ou5fmk1WzM1-AIbw9ZrOFSMT8V
-                        
-    --
-        - Questions:
-            - How often do we call the update step In terms of frequency of epochs? 
-            - Should we use the same matrix across all epochs or restart the training on the basis of an x number of epochs?      
-
         - TODO (Ideas/Ablation):
-            - Implement other stopping criteria (e.g., inertia).
             - Keep track of the average no. of iterations to converge and log this.
             - Keep track of the classes that are presenting empty clusters (log as well). 
             - How frequently should we perform E on the k-means? 
                 I sense that we could use a scheduler to increase the amount of epochs before performing E
                 e.g., start with 1 and double on every 10 epochs;
                 e.g., start with 1 for 10 epochs then double it on every 5. 
-
 '''
 class KMeansModule:
 
@@ -135,11 +105,6 @@ class KMeansModule:
         Because of that, another regularization mechanism that we could do to circumvent this is to reset the K-means
         centroids after every N epochs. (Another ablation parameter).  
 
-        This adds to the regularization strategies that we are building to avoid trivial solutions i.e., representational collapse and ablation parameters. 
-
-        (1) - Replace emtpy centroids by non empty ones with a perturbation.
-        (2) - Train K-means after every T epochs e.g., 2 or 3 (this gives the encoders some space to refine their features). 
-        (3) - Reset the K-means centroids after every N epochs (couldn't be deterministic)
     '''
     def assign(self, x, y, resources, rank, device, cached_features=None):
         D_batch = []
