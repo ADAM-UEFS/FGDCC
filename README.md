@@ -1,4 +1,4 @@
-# FGDCC: Fine-Grained Cluster Categorization - An Architecture for Intra-Class Variability in Problems in FGVC tasks
+# FGDCC: Fine-Grained Deep Cluster Categorization - An Architecture for Intra-Class Variability in Problems in FGVC tasks
 
 ## Method
 
