@@ -4,7 +4,7 @@
 
 ![FGDCC](https://github.com/FalsoMoralista/FGDCC/blob/main/util/images/FGDCC.png)
 
-FGDCC is an architecture developed to tackle intra-class variability problems in FGVC tasks. It operates by performing hierarchical classification of class-wise cluster-assignments, conditioned on parent labels (original dataset targets). 
+FGDCC is an architecture developed to tackle intra-class variability problems in FGVC tasks. It operates by performing hierarchical classification of class-wise cluster-assignments conditioned on parent labels (original dataset targets). 
 ---
 
 ### Requirements
@@ -12,7 +12,7 @@ FGDCC is an architecture developed to tackle intra-class variability problems in
 * PyTorch 2.0
 * torchvision
 * [Faiss](https://github.com/facebookresearch/faiss)
-* Other dependencies: pyyaml, numpy, opencv, submitit
+* Other dependencies: pyyaml, numpy, opencv, submitit, timm
 
 ## License
 See the [LICENSE](./LICENSE) file for details about the license under which this code is made available.
