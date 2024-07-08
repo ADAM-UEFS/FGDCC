@@ -413,6 +413,8 @@ def main(args, resume_preempt=False):
     accum_iter = 1
     start_epoch = resume_epoch
 
+    l2_norm = torch.nn.MSELoss()
+
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
 
@@ -464,7 +466,8 @@ def main(args, resume_preempt=False):
                     # Step 2. Autoencoder Dimensionality Reduction  
                     reconstructed_input, bottleneck_output = autoencoder(h_detached)                     
 
-                    reconstruction_loss = F.smooth_l1_loss(reconstructed_input, h_detached)
+                    #reconstruction_loss = F.smooth_l1_loss(reconstructed_input, h_detached)
+                    reconstruction_loss = l2_norm(reconstructed_input, h_detached)
 
                     # Step 3. Compute K-Means assignments with disabled autocast as faiss requires float32
                     with torch.cuda.amp.autocast(enabled=False): 

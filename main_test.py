@@ -13,7 +13,7 @@ import pprint
 import yaml
 
 from src.utils.distributed import init_distributed
-from test_deeper_cluster import main as app_main
+from test_FGDCC import main as app_main
 
 parser = argparse.ArgumentParser()
 parser.add_argument(

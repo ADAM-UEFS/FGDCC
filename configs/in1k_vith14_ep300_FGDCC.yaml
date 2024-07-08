@@ -19,7 +19,7 @@ data:
   use_horizontal_flip: false
   resume_epoch: 0
 logging:
-  folder: /home/rtcalumby/adam/luciano/LifeCLEFPlant2022/logs/PlantNet300k_run2
+  folder: /home/rtcalumby/adam/luciano/LifeCLEFPlant2022/logs/PlantNet300k_run3
   write_tag: jepa
 mask:
   allow_overlap: false
@@ -48,8 +48,8 @@ optimization:
   ema:
   - 0.9
   - 0.999
-  epochs: 75
-  final_lr: 2.5e-06 # Default: 1e-6
+  epochs: 50
+  final_lr: 3.0e-06 # Default: 1e-6
   final_weight_decay: 0.4  
   ipe_scale: 1.0
   lr: 2.5e-04 #0.0007 # Default 0.0015 -> lr = base lr × batchsize / 256. (learning rate formula). /0.0007
