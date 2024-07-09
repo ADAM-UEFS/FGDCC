@@ -14,8 +14,8 @@ from logging import getLogger
 
 logger = getLogger()
 
-
-def init_distributed(port=40112, rank_and_world_size=(None, None)):
+# default 40112
+def init_distributed(port=40113, rank_and_world_size=(None, None)):
 
     if dist.is_available() and dist.is_initialized():
         return dist.get_world_size(), dist.get_rank()

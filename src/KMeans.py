@@ -7,6 +7,10 @@ import faiss.contrib.torch_utils
 import numpy as np
 np.random.seed(0) # TODO: modify
 
+from src.utils.logging import (
+    CSVLogger,
+    AverageMeter)
+
 
 '''
         - TODO (Ideas/Ablation):
@@ -129,13 +133,13 @@ class KMeansModule:
         I_batch = torch.stack((I_batch))
         return D_batch, I_batch
 
-    def update(self, cached_features, device):
+    def update(self, cached_features, device, empty_clusters_per_epoch, empty_clusters_per_k_per_epoch):
         means = [[] for k in self.k_range]
         for key in cached_features.keys():
             xb = torch.stack(cached_features[key]) # Form an image batch
             if xb.get_device() == -1:
                 xb = xb.to(device, dtype=torch.float32)
-            _, batch_k_means_loss = self.iterative_kmeans(xb, key, device) # TODO: sum and average across dataset length
+            _, batch_k_means_loss = self.iterative_kmeans(xb, key, device, empty_clusters_per_epoch, empty_clusters_per_k_per_epoch) # TODO: sum and average across dataset length
             # log_loss.update(batch_k_means_loss.mean())
             # For each "batch" append the losses (average distances) for each K value.
             for k in range(len(self.k_range)):
@@ -145,15 +149,9 @@ class KMeansModule:
         for k in range(len(self.k_range)):
             stack = torch.stack(means[k])
             losses.append(stack.mean())
-        return losses
+        return losses, empty_clusters_per_epoch, empty_clusters_per_k_per_epoch
 
-    '''
-
-        TODO Create metric loggers to account for the stats:
-            - Track the average no. of iterations to converge per class and per K.
-            - Track the average no. empty clusters per class and per K.
-    '''
-    def iterative_kmeans(self, xb, class_index, device):
+    def iterative_kmeans(self, xb, class_index, device, empty_clusters_per_epoch, empty_clusters_per_k_per_epoch):
         empty_clusters = []
         D_per_K_value = torch.zeros(len(self.k_range)) # e.g., [2, 3, 4, 5]
         for k in range(len(self.k_range)):
@@ -225,7 +223,11 @@ class KMeansModule:
                 self.n_kmeans[class_index][k].index.add(new_centroids)    
                 D_per_K_value[k] = torch.mean(D)
         if len(empty_clusters) > 0:
-            print('Empty Clusters for class id:', class_index)
-            print(empty_clusters)
-            print('################# ################# #################')
+            empty_clusters_per_epoch.update(len(empty_clusters))
+            for entry in empty_clusters:
+                empty_clusters_per_k_per_epoch[(entry - 2)].update(1)
+            # TODO: remove
+            #print('Empty Clusters per k value for class id:', class_index)
+            #print(empty_clusters)
+            #print('################# ################# #################')
         return self.n_kmeans, D_per_K_value

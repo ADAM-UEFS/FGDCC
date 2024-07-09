@@ -509,6 +509,14 @@ def init_DC_opt(
     logger.info('Using AdamW')
     optimizer = torch.optim.AdamW(list(encoder.parameters()) + list(classifier.parameters()))
     AE_optimizer = torch.optim.AdamW(autoencoder.parameters())
+    
+    AE_scheduler = WarmupCosineSchedule(
+        AE_optimizer,
+        warmup_steps=int(warmup*iterations_per_epoch),
+        start_lr=2.5e-4,
+        ref_lr=7.5e-4,
+        final_lr=5.0e-6,
+        T_max=int(ipe_scale*num_epochs*iterations_per_epoch))
 
     scheduler = WarmupCosineSchedule(
         optimizer,
@@ -517,10 +525,11 @@ def init_DC_opt(
         ref_lr=ref_lr,
         final_lr=final_lr,
         T_max=int(ipe_scale*num_epochs*iterations_per_epoch))
+    
     wd_scheduler = CosineWDSchedule(
         optimizer,
         ref_wd=wd,
         final_wd=final_wd,
         T_max=int(ipe_scale*num_epochs*iterations_per_epoch))
     scaler = NativeScalerWithGradNormCount() if use_bfloat16 else None
-    return optimizer, AE_optimizer, scaler, scheduler, wd_scheduler 
+    return optimizer, AE_optimizer, AE_scheduler , scaler, scheduler, wd_scheduler 

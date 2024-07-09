@@ -193,6 +193,25 @@ def main(args, resume_preempt=False):
                            ('%d', 'Test time (ms)'),
                            ('%d', 'time (ms)'))
     
+    stats_logger = CSVLogger(folder + '/experiment_log.csv',
+                           ('%d', 'epoch'),
+                           ('%.3f', 'backbone lr'),
+                           ('%.3f', 'autoencoder lr'),
+                           ('%.5f', 'Total Train loss'),
+                           ('%.5f', 'Parent Train loss'),
+                           ('%.5f', 'Parent Test loss'),
+                           ('%.5f', 'Children loss'),
+                           ('%.5f', 'Reconstruction loss'),
+                           ('%.5f', 'K-Means loss'),
+                           ('%.3f', 'Test - Acc@1'),
+                           ('%.3f', 'Test - Acc@5'),
+                           ('%f', 'avg_empty_clusters_per_class'),
+                           ('%f', 'avg_empty_clusters_k=2'),
+                           ('%f', 'avg_empty_clusters_k=3'),
+                           ('%f', 'avg_empty_clusters_k=4'),
+                           ('%f', 'avg_empty_clusters_k=5'),
+                           ('%d', 'time (ms)'))
+    
     # -- init model
     encoder, predictor, autoencoder = init_model(
         device=device,
@@ -347,7 +366,7 @@ def main(args, resume_preempt=False):
     
     # -- Override previously loaded optimization configs.
     # Create one optimizer that takes into account both encoder and its classifier parameters.
-    optimizer, AE_optimizer, scaler, scheduler, wd_scheduler = init_DC_opt(
+    optimizer, AE_optimizer, AE_scheduler, scaler, scheduler, wd_scheduler = init_DC_opt(
         encoder=target_encoder,
         classifier=hierarchical_classifier,
         autoencoder=autoencoder,
@@ -395,6 +414,14 @@ def main(args, resume_preempt=False):
     k_means_module = KMeans.KMeansModule(nb_classes, dimensionality=384, k_range=K_range, resources=resources, config=config)
     #k_means_module = KMeans.KMeansModule(nb_classes, dimensionality=256, k_range=K_range, resources=resources, config=configs)
 
+    # TODO: track empty clusters per class?
+    # TODO FIXME: this logging is actually implemented incorrectly. 
+    # K-Means runs several iterations (until convergence) and from the way this is currently implemented
+    # the code is logging empty clusters per iteration. This way the same cluster can be logged many times across iterations.
+    # We will keep it as it is for now.
+    empty_clusters_per_epoch = AverageMeter() # Tracks the number of empty clusters per epoch and class
+    empty_clusters_per_k_per_epoch = [AverageMeter() for _ in K_range] 
+
     logger.info('Building cache...')
     cached_features_last_epoch = build_cache(data_loader=supervised_loader_train,
                                              device=device, target_encoder=target_encoder,
@@ -407,9 +434,15 @@ def main(args, resume_preempt=False):
     k_means_module.init(resources=resources, rank=rank, cached_features=cached_features_last_epoch, config=config, device=device) # E-step
     logger.info('Done.')
     logger.info('M - Step...')
-    M_losses = k_means_module.update(cached_features_last_epoch, device) # M-step
+    M_losses, empty_clusters_per_epoch, empty_clusters_per_k_per_epoch = k_means_module.update(cached_features_last_epoch, device, empty_clusters_per_epoch, empty_clusters_per_k_per_epoch) # M-step
     print('Losses', M_losses)
-    
+    print('Avg no of empty clusters:', empty_clusters_per_epoch.avg)
+    print('Empty clusters per K:')
+    print(empty_clusters_per_k_per_epoch[0].avg,
+          empty_clusters_per_k_per_epoch[1].avg,
+          empty_clusters_per_k_per_epoch[2].avg,
+          empty_clusters_per_k_per_epoch[3].avg)
+
     accum_iter = 1
     start_epoch = resume_epoch
 
@@ -447,7 +480,8 @@ def main(args, resume_preempt=False):
             
             imgs, targets = load_imgs()
 
-            def train_step():    
+            def train_step():
+                _new_AE_lr = AE_scheduler.step()    
                 _new_lr = scheduler.step() 
                 _new_wd = wd_scheduler.step()
                 
@@ -575,9 +609,9 @@ def main(args, resume_preempt=False):
                     optimizer.zero_grad()
                     AE_optimizer.zero_grad()
 
-                return (float(loss), float(k_means_loss), _new_lr, _new_wd, grad_stats, bottleneck_output)
+                return (float(loss), float(k_means_loss), _new_AE_lr, _new_lr, _new_wd, grad_stats, bottleneck_output)
 
-            (loss, k_means_loss, _new_lr, _new_wd, grad_stats, bottleneck_output), etime = gpu_timer(train_step)
+            (loss, k_means_loss, ae_lr, _new_lr, _new_wd, grad_stats, bottleneck_output), etime = gpu_timer(train_step)
                        
             total_loss_meter.update(loss)
             k_means_loss_meter.update(k_means_loss)
@@ -590,7 +624,7 @@ def main(args, resume_preempt=False):
                     logger.info('[%d, %5d/%5d] - train_losses - Parent Class: %.3f -'
                                 ' Children class: %.3f -'
                                 'Autoencoder Loss (total): %.3f - Reconstruction/K-Means Loss: [%.3f / %.3f] - '
-                                '[wd: %.2e] [lr: %.2e] '
+                                '[wd: %.2e] [lr: %.2e] [autoencoder lr: %.2e]'
                                 '[mem: %.2e] '
                                 '(%.1f ms)'
 
@@ -600,6 +634,7 @@ def main(args, resume_preempt=False):
                                     (reconstruction_loss_meter.avg + k_means_loss_meter.avg), reconstruction_loss_meter.avg, k_means_loss_meter.avg,
                                     _new_wd,
                                     _new_lr,
+                                    ae_lr,
                                     torch.cuda.max_memory_allocated() / 1024.**2,
                                     time_meter.avg))
                     
@@ -659,7 +694,6 @@ def main(args, resume_preempt=False):
         # Assert everything went fine
         cnt = [len(cached_features[key]) for key in cached_features.keys()]    
         assert sum(cnt) == 245897, 'Cache not compatible, corrupted or missing'
-        #logger.info('No. samples in the cache:', (sum(cnt)), 'Num. classes:', len(cached_features.keys()))
 
         # TODO: same cache problem happens over here.
         # Each centroid replica is been updated according to the subset of the dataset
@@ -669,6 +703,13 @@ def main(args, resume_preempt=False):
         
         # -- Perform M step on K-means module
         M_losses = k_means_module.update(cached_features, device)
+        print('Avg no of empty clusters:', empty_clusters_per_epoch.avg)
+        print('Empty clusters per K:')
+        print(empty_clusters_per_k_per_epoch[0].avg,
+            empty_clusters_per_k_per_epoch[1].avg,
+            empty_clusters_per_k_per_epoch[2].avg,
+            empty_clusters_per_k_per_epoch[3].avg)
+    
         #for k in range(len(K_range)):            
         #    logger.info('Average K-Means Loss after M step: [K=',K_range[k],', value:', M_losses[k],']')
         cached_features_last_epoch = copy.deepcopy(cached_features)
@@ -704,12 +745,33 @@ def main(args, resume_preempt=False):
         
         vtime = gpu_timer(evaluate)
         
+        stats_logger.log(epoch + 1,
+                        lr,
+                        ae_lr, 
+                        total_loss_meter.avg,
+                        parent_cls_loss_meter.avg,
+                        test_loss.avg,
+                        children_cls_loss_meter.avg,
+                        reconstruction_loss_meter.avg,
+                        k_means_loss.avg,
+                        testAcc1.avg,
+                        testAcc5.avg,
+                        empty_clusters_per_k_per_epoch[0].avg,
+                        empty_clusters_per_k_per_epoch[1].avg,
+                        empty_clusters_per_k_per_epoch[2].avg,
+                        empty_clusters_per_k_per_epoch[3].avg,
+                        time_meter.avg)
+
         # -- Save Checkpoint after every epoch
         logger.info('avg. train_loss %.3f' % total_loss_meter.avg)
         logger.info('avg. test_loss %.3f avg. Accuracy@1 %.3f - avg. Accuracy@5 %.3f' % (test_loss.avg, testAcc1.avg, testAcc5.avg))
         save_checkpoint(epoch+1)
         assert not np.isnan(loss), 'loss is nan'
         logger.info('Loss %.4f' % loss)
+        
+        # -- Reset loggers at end of the epoch
+        empty_clusters_per_epoch = AverageMeter() # Tracks the number of empty clusters per class 
+        empty_clusters_per_k_per_epoch = [AverageMeter() for _ in K_range]
 
 if __name__ == "__main__":
     main()
