@@ -41,7 +41,6 @@ class KMeansModule:
             for _ in range(nb_classes):
                 self.n_kmeans.append([faiss.Kmeans(d=dimensionality, k=k, niter=1, verbose=False, min_points_per_centroid = 1) for k in k_range])                                                            
 
-
     def my_index_cpu_to_gpu_multiple(self, resources, index, co=None, gpu_nos=None):
         vres = faiss.GpuResourcesVector()
         vdev = faiss.IntVector()
@@ -54,6 +53,9 @@ class KMeansModule:
         index.referenced_objects = resources
         return index
     
+    def CosineClusterIndex(self, xb, yb, cached_features):
+        return 0
+
     def initialize_centroids(self, batch_x, class_id, resources, rank, device, config, cached_features):
         def augment(x, n_samples): # Built as a helper function for development TODO: remove
             # Workaround to handle faiss centroid initialization with a single sample.

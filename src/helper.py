@@ -125,23 +125,32 @@ class ParentClassifier(nn.Module):
     def __init__(self, input_dim, num_parents):
         super(ParentClassifier, self).__init__()
         self.fc = nn.Linear(input_dim, num_parents)
+        self.proj = nn.Linear(num_parents, 128)
+        trunc_normal_(self.proj.weight, std=2e-5)
         trunc_normal_(self.fc.weight, std=2e-5)
         if self.fc.bias is not None:
             torch.nn.init.constant_(self.fc.bias, 0)
+            torch.nn.init.constant_(self.proj.bias, 0)
 
     def forward(self, x):
-        return self.fc(x)
+        x = self.fc(x)
+        return x, self.proj(x)
 
 class ChildClassifier(nn.Module):
     def __init__(self, input_dim, num_children):
         super(ChildClassifier, self).__init__()
         self.fc = nn.Linear(input_dim, num_children)
+        self.proj = nn.Linear(num_children, 128)
+        
+        trunc_normal_(self.proj.weight, std=2e-5)
         trunc_normal_(self.fc.weight, std=2e-5)
         if self.fc.bias is not None:
             torch.nn.init.constant_(self.fc.bias, 0)
+            torch.nn.init.constant_(self.proj.bias, 0)
     
     def forward(self, x):
-        return self.fc(x)
+        x = self.fc(x)
+        return x, self.proj(x)
 
 '''
     Hierarchical Classifier
@@ -180,7 +189,7 @@ class HierarchicalClassifier(nn.Module):
 
     def forward(self, x, device):
         x = self.head_drop(x)
-        parent_logits = self.parent_classifier(x)  # Shape (batch_size, num_parents)
+        parent_logits, parent_proj_embeddings = self.parent_classifier(x)  # Shape (batch_size, num_parents)
         parent_probs = F.softmax(parent_logits, dim=1)  # Softmax over class dimension
 
         # The parent class prediction allows to select the index for the correspondent subclass classifier
@@ -188,11 +197,14 @@ class HierarchicalClassifier(nn.Module):
 
         # Use the predicted parent class to select the corresponding child classifier
         child_logits = [torch.zeros(x.size(0), num, device=device) for num in self.num_children_per_parent] # Each element within child_logits is associated to a classifier with K outputs.
+        child_proj_embeddings = [torch.zeros(x.size(0), 128, device=device) for num in self.num_children_per_parent] # Each element within child_logits is associated to a classifier with K outputs.
         for i in range(len(self.num_children_per_parent)):
             for j in range(x.size(0)): # Iterate over each sample in the batch                   
                 # We will make predictions for each value of K belonging to num_children_per_parent (e.g., [2,3,4,5]) 
-                child_logits[i][j] = self.child_classifiers[i][parent_class[j]](x[j])
-        return parent_logits, child_logits
+                logits, proj_embeddings = self.child_classifiers[i][parent_class[j]](x[j])
+                child_logits[i][j] = logits
+                child_proj_embeddings[i][j] = proj_embeddings
+        return parent_logits, child_logits, parent_proj_embeddings, child_proj_embeddings
 
 
 class FinetuningModel(nn.Module):

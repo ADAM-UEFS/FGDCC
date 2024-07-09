@@ -67,7 +67,7 @@ import faiss
 
 # --
 log_timings = True
-log_freq = 25
+log_freq = 50
 checkpoint_freq = 1
 # --
 
@@ -203,6 +203,7 @@ def main(args, resume_preempt=False):
                            ('%.5f', 'Children loss'),
                            ('%.5f', 'Reconstruction loss'),
                            ('%.5f', 'K-Means loss'),
+                           ('%.5f', 'Consistency loss'),
                            ('%.3f', 'Test - Acc@1'),
                            ('%.3f', 'Test - Acc@5'),
                            ('%f', 'avg_empty_clusters_per_class'),
@@ -421,7 +422,7 @@ def main(args, resume_preempt=False):
     # We will keep it as it is for now.
     empty_clusters_per_epoch = AverageMeter() # Tracks the number of empty clusters per epoch and class
     empty_clusters_per_k_per_epoch = [AverageMeter() for _ in K_range] 
-
+    
     logger.info('Building cache...')
     cached_features_last_epoch = build_cache(data_loader=supervised_loader_train,
                                              device=device, target_encoder=target_encoder,
@@ -458,6 +459,7 @@ def main(args, resume_preempt=False):
         total_loss_meter = AverageMeter()
         parent_cls_loss_meter = AverageMeter()
         children_cls_loss_meter = AverageMeter()
+        consistency_loss_meter = AverageMeter()
         reconstruction_loss_meter = AverageMeter()
         k_means_loss_meter = AverageMeter()
 
@@ -512,45 +514,83 @@ def main(args, resume_preempt=False):
                     #print('Assignments format', k_means_assignments.size()) 
 
                     # Step 4. Hierarchical Classification
-                    parent_logits, child_logits = hierarchical_classifier(h, device)
+                    parent_logits, child_logits, parent_proj_embeddings, child_proj_embeddings = hierarchical_classifier(h, device)
 
                     loss = loss_fn(parent_logits, targets)
                     parent_cls_loss_meter.update(loss)
-                    
-                    # Model selection: Iterate through every K classifier computing the loss then select the ones with smallest values 
-                    subclass_losses = []
-                    for k in range(len(K_range)):
-                        k_means_target = k_means_assignments[:,k,:]
-                        k_means_target = k_means_target.squeeze(1)
-                        subclass_loss = CEL_no_reduction(child_logits[k], k_means_target) 
-                        #print('Subclass loss shape', subclass_loss.size())
-                        #print('Subclass loss', subclass_loss)
-                        subclass_losses.append(subclass_loss)
+                    ################################################## Under inspection #########################################################
+                    #############################################################################################################################
+                    classifier_selection = True
+                    if classifier_selection:
+                        # Model selection: Iterate through every K classifier computing the loss then select the ones with smallest values 
+                        subclass_losses = []
+                        for k in range(len(K_range)):
+                            k_means_target = k_means_assignments[:,k,:]
+                            k_means_target = k_means_target.squeeze(1)
+                            subclass_loss = CEL_no_reduction(child_logits[k], k_means_target) 
+                            #print('Subclass loss shape', subclass_loss.size())
+                            #print('Subclass loss', subclass_loss)
+                            subclass_losses.append(subclass_loss)
 
-                    subclass_losses = torch.vstack(subclass_losses)
-                    #print(subclass_losses)
-                    #print(subclass_losses.size())
-                    best_k_indexes = torch.argmin(subclass_losses, dim=0)
-                    #print('Best K index by datapoint:', best_k_indexes)
-                    #print(best_k_indexes.size())
+                        subclass_losses = torch.vstack(subclass_losses)
+                        #print(subclass_losses)
+                        #print(subclass_losses.size())
+                        best_k_indexes = torch.argmin(subclass_losses, dim=0)
+
+                        #print('Best K index by datapoint:', best_k_indexes)
+                        #print(best_k_indexes.size())
+                    #############################################################################################################################
+                    #############################################################################################################################
+
+                    # -- -- -- -- -- -- -- -- -- -- -- -- 
+                    #############################################################################################################################
+                    # Model selection: Iterate through every K classifier computing the cosine similarity and select the ones with largest values 
+                    #subclass_cosine_similarities = []
+                    #for k in range(len(K_range)):
+                    #    k_means_target = k_means_assignments[:,k,:]
+                    #    k_means_target = k_means_target.squeeze(1)
+
+                        # Normalize child logits and k-means target
+                        #normalized_child_logits = F.normalize(child_logits[k], p=2, dim=1)
+                        #normalized_k_means_target = F.normalize(k_means_target, p=2, dim=1)
+                        
+                        # Compute cosine similarity
+                        #cosine_similarity = torch.sum(normalized_child_logits * normalized_k_means_target, dim=1)
+                        #subclass_cosine_similarities.append(cosine_similarity)
+
+                    #subclass_cosine_similarities = torch.vstack(subclass_cosine_similarities)
+                    #best_k_indexes = torch.argmax(subclass_cosine_similarities, dim=0)
+                    #############################################################################################################################
+                    #############################################################################################################################
+                    parent_proj_embeddings, child_proj_embeddings
+                    
+                    # -- Setup losses
                     subclass_loss = 0
                     k_means_loss = 0
+                    consistency_loss = 0
+
                     k_means_losses = k_means_losses.squeeze(2).transpose(0,1)
                     #print('K-means losses:', k_means_losses.size())
+
+                    parent_probs = F.softmax(parent_proj_embeddings, dim=1)
+                    subclass_probs = [F.softmax(proj_embedding, dim=1) for proj_embedding in child_proj_embeddings]
+
                     size = imgs.size(0) # This allows handling cases when the number of points is different from batch size (due to drop_last=False)
                     for i in range(size):
                         subclass_loss += subclass_losses[best_k_indexes[i]][i]
                         k_means_loss += k_means_losses[best_k_indexes[i]][i]
+                        consistency_loss += F.kl_div(subclass_probs[best_k_indexes[i]], parent_probs[i], reduction='batchmean') # Consistency Regularization with KL Divergence
 
-                    # Update loss meters (divide by the length of the image batch instead of batch_size)               
+                    # -- Mean reduction
                     subclass_loss /= size
                     k_means_loss /= size
 
                     subclass_loss = AllReduce.apply(subclass_loss).clone()
                     children_cls_loss_meter.update(subclass_loss)
                     
+                    consistency_loss_meter.update(consistency_loss)
                     # Sum parent and subclass loss
-                    loss += subclass_loss
+                    loss += subclass_loss + consistency_loss 
                     
                     reconstruction_loss = AllReduce.apply(reconstruction_loss).clone()
                     reconstruction_loss_meter.update(reconstruction_loss)
@@ -623,15 +663,16 @@ def main(args, resume_preempt=False):
                 if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
                     logger.info('[%d, %5d/%5d] - train_losses - Parent Class: %.3f -'
                                 ' Children class: %.3f -'
-                                'Autoencoder Loss (total): %.3f - Reconstruction/K-Means Loss: [%.3f / %.3f] - '
+                                'Autoencoder Loss (total): %.3f - Reconstruction/K-Means Loss: [%.3f / %.3f] - Consistency Loss: [%.3f]'
                                 '[wd: %.2e] [lr: %.2e] [autoencoder lr: %.2e]'
                                 '[mem: %.2e] '
                                 '(%.1f ms)'
 
                                 % (epoch + 1, itr, ipe,
-                                    total_loss_meter.avg,
+                                    parent_cls_loss_meter.avg,
                                     children_cls_loss_meter.avg,
                                     (reconstruction_loss_meter.avg + k_means_loss_meter.avg), reconstruction_loss_meter.avg, k_means_loss_meter.avg,
+                                    consistency_loss_meter.avg,
                                     _new_wd,
                                     _new_lr,
                                     ae_lr,
@@ -702,7 +743,7 @@ def main(args, resume_preempt=False):
         # Good news is that we only have to make the cache consistent in order to make the k-means consistent as well.
         
         # -- Perform M step on K-means module
-        M_losses = k_means_module.update(cached_features, device)
+        M_losses = k_means_module.update(cached_features, device, empty_clusters_per_epoch, empty_clusters_per_k_per_epoch)
         print('Avg no of empty clusters:', empty_clusters_per_epoch.avg)
         print('Empty clusters per K:')
         print(empty_clusters_per_k_per_epoch[0].avg,
@@ -744,7 +785,7 @@ def main(args, resume_preempt=False):
                 test_loss.update(loss)
         
         vtime = gpu_timer(evaluate)
-        
+
         stats_logger.log(epoch + 1,
                         lr,
                         ae_lr, 
@@ -753,9 +794,11 @@ def main(args, resume_preempt=False):
                         test_loss.avg,
                         children_cls_loss_meter.avg,
                         reconstruction_loss_meter.avg,
-                        k_means_loss.avg,
+                        k_means_loss_meter.avg,
+                        consistency_loss_meter.avg,
                         testAcc1.avg,
                         testAcc5.avg,
+                        empty_clusters_per_epoch.avg,
                         empty_clusters_per_k_per_epoch[0].avg,
                         empty_clusters_per_k_per_epoch[1].avg,
                         empty_clusters_per_k_per_epoch[2].avg,
