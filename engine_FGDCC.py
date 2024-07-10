@@ -562,7 +562,6 @@ def main(args, resume_preempt=False):
                     #best_k_indexes = torch.argmax(subclass_cosine_similarities, dim=0)
                     #############################################################################################################################
                     #############################################################################################################################
-                    parent_proj_embeddings, child_proj_embeddings
                     
                     # -- Setup losses
                     subclass_loss = 0
@@ -579,11 +578,15 @@ def main(args, resume_preempt=False):
                     for i in range(size):
                         subclass_loss += subclass_losses[best_k_indexes[i]][i]
                         k_means_loss += k_means_losses[best_k_indexes[i]][i]
-                        consistency_loss += F.kl_div(subclass_probs[best_k_indexes[i]], parent_probs[i], reduction='batchmean') # Consistency Regularization with KL Divergence
+                        #consistency_loss += F.kl_div(parent_probs[i], subclass_probs[best_k_indexes[i]], reduction='batchmean') # Consistency Regularization with KL Divergence
+                    
+                    # TODO: test below
+                    consistency_loss += F.kl_div(parent_probs, subclass_probs[best_k_indexes], reduction='batchmean') # Consistency Regularization with KL Divergence
 
                     # -- Mean reduction
                     subclass_loss /= size
                     k_means_loss /= size
+                    #consistency_loss /= size
 
                     subclass_loss = AllReduce.apply(subclass_loss).clone()
                     children_cls_loss_meter.update(subclass_loss)
@@ -775,7 +778,7 @@ def main(args, resume_preempt=False):
                                  
                 with torch.cuda.amp.autocast():
                     output = target_encoder(images)
-                    parent_logits, _ = hierarchical_classifier(output, device)                    
+                    parent_logits, _, _, _ = hierarchical_classifier(output, device)                    
                     loss = crossentropy(parent_logits, labels)
                 
                 acc1, acc5 = accuracy(parent_logits, labels, topk=(1, 5))

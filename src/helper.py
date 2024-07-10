@@ -134,6 +134,7 @@ class ParentClassifier(nn.Module):
 
     def forward(self, x):
         x = self.fc(x)
+        x = F.layer_norm(x, (x.size(-1),))  # normalize over feature-dim 
         return x, self.proj(x)
 
 class ChildClassifier(nn.Module):
@@ -149,7 +150,8 @@ class ChildClassifier(nn.Module):
             torch.nn.init.constant_(self.proj.bias, 0)
     
     def forward(self, x):
-        x = self.fc(x)
+        x = self.fc(x)        
+        x = F.layer_norm(x, (x.size(-1),))  # normalize over feature-dim 
         return x, self.proj(x)
 
 '''
