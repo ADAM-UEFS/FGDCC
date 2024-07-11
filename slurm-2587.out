@@ -1,0 +1,160 @@
+INFO:faiss.loader:Loading faiss with AVX2 support.
+INFO:faiss.loader:Successfully loaded faiss with AVX2 support.
+INFO:faiss.loader:Loading faiss with AVX2 support.
+INFO:faiss.loader:Successfully loaded faiss with AVX2 support.
+INFO:root:called-params configs/in1k_vith14_ep300_FGDCC.yaml
+INFO:root:loaded params...
+{   'data': {   'batch_size': 96,
+                'color_jitter_strength': 0.0,
+                'crop_scale': [0.3, 1.0],
+                'crop_size': 224,
+                'cutmix': 0.0,
+                'drop_path': 0.25,
+                'image_folder': '/home/rtcalumby/adam/luciano/plantnet_300K/',
+                'mixup': 0.0,
+                'nb_classes': 1081,
+                'num_workers': 8,
+                'pin_mem': True,
+                'reprob': 0.25,
+                'resume_epoch': 0,
+                'root_path': '/home/rtcalumby/adam/luciano/',
+                'use_color_distortion': False,
+                'use_gaussian_blur': False,
+                'use_horizontal_flip': False},
+    'logging': {   'folder': '/home/rtcalumby/adam/luciano/LifeCLEFPlant2022/logs/PlantNet300k_run3',
+                   'write_tag': 'jepa'},
+    'mask': {   'allow_overlap': False,
+                'aspect_ratio': [0.75, 1.5],
+                'enc_mask_scale': [0.85, 1.0],
+                'min_keep': 10,
+                'num_enc_masks': 1,
+                'num_pred_masks': 4,
+                'patch_size': 14,
+                'pred_mask_scale': [0.15, 0.2]},
+    'meta': {   'copy_data': False,
+                'load_checkpoint': True,
+                'model_name': 'vit_huge',
+                'pred_depth': 12,
+                'pred_emb_dim': 384,
+                'read_checkpoint': None,
+                'use_bfloat16': True},
+    'optimization': {   'ema': [0.9, 0.999],
+                        'epochs': 50,
+                        'final_lr': 3e-06,
+                        'final_weight_decay': 0.4,
+                        'ipe_scale': 1.0,
+                        'label_smoothing': 0.1,
+                        'lr': 0.00025,
+                        'start_lr': 7.5e-05,
+                        'warmup': 10,
+                        'weight_decay': 0.05}}
+INFO:root:Running... (rank: 0/1)
+INFO:root:Initialized (rank/world-size) 0/1
+INFO:root:AutoEncoder(
+  (encoder): Sequential(
+    (0): Linear(in_features=1280, out_features=1024, bias=True)
+    (1): GELU(approximate='none')
+    (2): Linear(in_features=1024, out_features=768, bias=True)
+    (3): GELU(approximate='none')
+    (4): Linear(in_features=768, out_features=384, bias=True)
+    (5): GELU(approximate='none')
+  )
+  (decoder): Sequential(
+    (0): Linear(in_features=384, out_features=768, bias=True)
+    (1): GELU(approximate='none')
+    (2): Linear(in_features=768, out_features=1024, bias=True)
+    (3): GELU(approximate='none')
+    (4): Linear(in_features=1024, out_features=1280, bias=True)
+  )
+  (dropout): Dropout(p=0.25, inplace=False)
+  (out): Sigmoid()
+)
+INFO:root:making imagenet data transforms
+INFO:root:making imagenet data transforms
+INFO:root:Finetuning dataset created
+Training dataset, length: 245952
+INFO:root:Finetuning dataset created
+Val dataset, length: 31200
+INFO:root:Using AdamW
+['encoder', 'predictor', 'opt', 'scaler', 'target_encoder', 'epoch', 'loss', 'batch_size', 'world_size', 'lr']
+INFO:root:loaded pretrained encoder from epoch 66 with msg: <All keys matched successfully>
+INFO:root:Using AdamW
+INFO:root:DistributedDataParallel(
+  (module): FinetuningModel(
+    (pretrained_model): VisionTransformer(
+      (patch_embed): PatchEmbed(
+        (proj): Conv2d(3, 1280, kernel_size=(14, 14), stride=(14, 14))
+      )
+      (blocks): ModuleList(
+        (0-31): 32 x Block(
+          (norm1): LayerNorm((1280,), eps=1e-06, elementwise_affine=True)
+          (attn): Attention(
+            (qkv): Linear(in_features=1280, out_features=3840, bias=True)
+            (attn_drop): Dropout(p=0.0, inplace=False)
+            (proj): Linear(in_features=1280, out_features=1280, bias=True)
+            (proj_drop): Dropout(p=0.0, inplace=False)
+          )
+          (drop_path): Identity()
+          (norm2): LayerNorm((1280,), eps=1e-06, elementwise_affine=True)
+          (mlp): MLP(
+            (fc1): Linear(in_features=1280, out_features=5120, bias=True)
+            (act): GELU(approximate='none')
+            (fc2): Linear(in_features=5120, out_features=1280, bias=True)
+            (drop): Dropout(p=0.0, inplace=False)
+          )
+        )
+      )
+      (norm): LayerNorm((1280,), eps=1e-06, elementwise_affine=True)
+    )
+    (head_drop): Dropout(p=0.25, inplace=False)
+  )
+)
+INFO:root:Building cache...
+INFO:root:Done.
+INFO:root:Initializing centroids...
+INFO:root:Done.
+INFO:root:M - Step...
+INFO:root:Epoch 1
+INFO:faiss.loader:Loading faiss with AVX2 support.
+INFO:faiss.loader:Successfully loaded faiss with AVX2 support.
+INFO:faiss.loader:Loading faiss with AVX2 support.
+INFO:faiss.loader:Successfully loaded faiss with AVX2 support.
+INFO:faiss.loader:Loading faiss with AVX2 support.
+INFO:faiss.loader:Successfully loaded faiss with AVX2 support.
+INFO:faiss.loader:Loading faiss with AVX2 support.
+INFO:faiss.loader:Successfully loaded faiss with AVX2 support.
+INFO:faiss.loader:Loading faiss with AVX2 support.
+INFO:faiss.loader:Successfully loaded faiss with AVX2 support.
+INFO:faiss.loader:Loading faiss with AVX2 support.
+INFO:faiss.loader:Successfully loaded faiss with AVX2 support.
+INFO:faiss.loader:Loading faiss with AVX2 support.
+INFO:faiss.loader:Successfully loaded faiss with AVX2 support.
+INFO:faiss.loader:Loading faiss with AVX2 support.
+INFO:faiss.loader:Successfully loaded faiss with AVX2 support.
+/home/rtcalumby/miniconda3/envs/py382/lib/python3.12/site-packages/faiss/contrib/torch_utils.py:51: UserWarning: TypedStorage is deprecated. It will be removed in the future and UntypedStorage will be the only storage class. This should only matter to you if you are using storages directly.  To access UntypedStorage directly, use tensor.untyped_storage() instead of tensor.storage()
+  x.storage().data_ptr() + x.storage_offset() * 4)
+Process Process-1:
+Traceback (most recent call last):
+  File "/home/rtcalumby/miniconda3/envs/py382/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/home/rtcalumby/miniconda3/envs/py382/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/rtcalumby/adam/luciano/LifeCLEFPlant2022/DeepCluster/main_FGDCC.py", line 52, in process_main
+    app_main(args=params)
+  File "/home/rtcalumby/adam/luciano/LifeCLEFPlant2022/DeepCluster/engine_FGDCC.py", line 673, in main
+    (loss, k_means_loss, ae_lr, _new_lr, _new_wd, grad_stats, bottleneck_output), etime = gpu_timer(train_step)
+                                                                                          ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/rtcalumby/adam/luciano/LifeCLEFPlant2022/DeepCluster/src/utils/logging.py", line 21, in gpu_timer
+    result = closure()
+             ^^^^^^^^^
+  File "/home/rtcalumby/adam/luciano/LifeCLEFPlant2022/DeepCluster/engine_FGDCC.py", line 601, in train_step
+    consistency_loss = F.kl_div(parent_probs, subclass_probs[best_k_indexes], reduction='batchmean')
+                                              ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+TypeError: only integer tensors of a single element can be converted to an index
+For loop:
+Checking subclass:  tensor(0.6935, device='cuda:0', grad_fn=<DivBackward0>)
+Checking k_means:  tensor(238.4887, device='cuda:0')
+Consistency loss: tensor(nan, device='cuda:0', grad_fn=<DivBackward0>)
+Vectorized:
+Checking subclass:  tensor(0.6935, device='cuda:0', grad_fn=<MeanBackward0>)
+Checking k_means:  tensor(238.4888, device='cuda:0')

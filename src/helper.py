@@ -122,10 +122,12 @@ def load_DC_checkpoint(
 
 
 class ParentClassifier(nn.Module):
-    def __init__(self, input_dim, num_parents):
+    def __init__(self, input_dim, proj_embed_dim ,num_parents):
         super(ParentClassifier, self).__init__()
+        self.proj_embed_dim = proj_embed_dim
         self.fc = nn.Linear(input_dim, num_parents)
-        self.proj = nn.Linear(num_parents, 128)
+        self.proj = nn.Linear(num_parents, self.proj_embed_dim)
+        self.drop = nn.Dropout(0.2)
         trunc_normal_(self.proj.weight, std=2e-5)
         trunc_normal_(self.fc.weight, std=2e-5)
         if self.fc.bias is not None:
@@ -135,13 +137,15 @@ class ParentClassifier(nn.Module):
     def forward(self, x):
         x = self.fc(x)
         x = F.layer_norm(x, (x.size(-1),))  # normalize over feature-dim 
-        return x, self.proj(x)
+        return x, self.proj(self.drop(x))
 
 class ChildClassifier(nn.Module):
-    def __init__(self, input_dim, num_children):
+    def __init__(self, input_dim, proj_embed_dim, num_children):
         super(ChildClassifier, self).__init__()
+        self.proj_embed_dim = proj_embed_dim
         self.fc = nn.Linear(input_dim, num_children)
-        self.proj = nn.Linear(num_children, 128)
+        self.proj = nn.Linear(num_children, self.proj_embed_dim)
+        self.drop = nn.Dropout(0.2)
         
         trunc_normal_(self.proj.weight, std=2e-5)
         trunc_normal_(self.fc.weight, std=2e-5)
@@ -152,7 +156,7 @@ class ChildClassifier(nn.Module):
     def forward(self, x):
         x = self.fc(x)        
         x = F.layer_norm(x, (x.size(-1),))  # normalize over feature-dim 
-        return x, self.proj(x)
+        return x, self.proj(self.drop(x))
 
 '''
     Hierarchical Classifier
@@ -177,15 +181,16 @@ class ChildClassifier(nn.Module):
 
 '''
 class HierarchicalClassifier(nn.Module):
-    def __init__(self, input_dim, num_parents, drop_path, num_children_per_parent):
+    def __init__(self, input_dim, num_parents, drop_path, proj_embed_dim, num_children_per_parent):
         super(HierarchicalClassifier, self).__init__()
+        self.proj_embed_dim = proj_embed_dim
         self.head_drop = nn.Dropout(drop_path)
         self.num_parents = num_parents
         self.num_children_per_parent = num_children_per_parent
-        self.parent_classifier = ParentClassifier(input_dim, num_parents)
+        self.parent_classifier = ParentClassifier(input_dim, proj_embed_dim, num_parents)
         self.child_classifiers = nn.ModuleList(
             [nn.ModuleList(
-                [ChildClassifier(input_dim, num_children) for _ in range(num_parents)]
+                [ChildClassifier(input_dim, proj_embed_dim ,num_children) for _ in range(num_parents)]
             ) for num_children in num_children_per_parent]    
         )
 
@@ -199,7 +204,7 @@ class HierarchicalClassifier(nn.Module):
 
         # Use the predicted parent class to select the corresponding child classifier
         child_logits = [torch.zeros(x.size(0), num, device=device) for num in self.num_children_per_parent] # Each element within child_logits is associated to a classifier with K outputs.
-        child_proj_embeddings = [torch.zeros(x.size(0), 128, device=device) for num in self.num_children_per_parent] # Each element within child_logits is associated to a classifier with K outputs.
+        child_proj_embeddings = [torch.zeros(x.size(0), self.proj_embed_dim, device=device) for num in self.num_children_per_parent] # Each element within child_logits is associated to a classifier with K outputs.
         for i in range(len(self.num_children_per_parent)):
             for j in range(x.size(0)): # Iterate over each sample in the batch                   
                 # We will make predictions for each value of K belonging to num_children_per_parent (e.g., [2,3,4,5]) 
@@ -301,19 +306,69 @@ class FinetuningModel(nn.Module):
         x = self.parent_classifier(x)
         return x
 
-    
 def configure_finetuning(pretrained_model, drop_path, nb_classes, device):
     model = FinetuningModel(pretrained_model, drop_path, nb_classes)    
     model.to(device)
     return model         
 
-def get_classification_head(embed_dim, drop_path, nb_classes, K_range, device):
+def get_classification_head(embed_dim, drop_path, nb_classes, K_range, proj_embed_dim, device):
     model = HierarchicalClassifier(input_dim=embed_dim,
                                    num_parents=nb_classes,
                                    drop_path=drop_path,
+                                   proj_embed_dim=proj_embed_dim,
                                    num_children_per_parent=K_range)        
     model.to(device)
     return model                 
+
+def off_diagonal(x):
+    n, m = x.shape
+    assert n == m
+    return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+
+
+class VICReg(nn.Module):
+    def __init__(self, args, num_features, sim_coeff, std_coeff, cov_coeff):
+        super().__init__()
+        self.args = args
+        self.num_features = num_features
+        
+        self.sim_coeff = sim_coeff
+        self.std_coeff = std_coeff
+        self.cov_coeff = cov_coeff
+         
+        #self.backbone, self.embedding = resnet.__dict__[args.arch](
+        #    zero_init_residual=True
+        #)
+        #self.projector = Projector(args, self.embedding)
+
+    def forward(self, x, y):
+        #x = self.projector(self.backbone(x))
+        #y = self.projector(self.backbone(y))
+        batch_size = x.size(0)
+        repr_loss = F.mse_loss(x, y)
+
+        #x = torch.cat(FullGatherLayer.apply(x), dim=0)
+        #y = torch.cat(FullGatherLayer.apply(y), dim=0)
+        x = x - x.mean(dim=0)
+        y = y - y.mean(dim=0)
+
+        std_x = torch.sqrt(x.var(dim=0) + 0.0001)
+        std_y = torch.sqrt(y.var(dim=0) + 0.0001)
+        std_loss = torch.mean(F.relu(1 - std_x)) / 2 + torch.mean(F.relu(1 - std_y)) / 2
+
+        cov_x = (x.T @ x) / (batch_size - 1)
+        cov_y = (y.T @ y) / (batch_size - 1)
+        cov_loss = off_diagonal(cov_x).pow_(2).sum().div(
+            self.num_features
+        ) + off_diagonal(cov_y).pow_(2).sum().div(self.num_features)
+
+        loss = (
+            self.sim_coeff * repr_loss
+            + self.std_coeff * std_loss
+            + self.cov_coeff * cov_loss
+        )
+        return loss    
+
 
 # Borrowed from MAE.
 class NativeScalerWithGradNormCount:
@@ -527,7 +582,7 @@ def init_DC_opt(
     AE_scheduler = WarmupCosineSchedule(
         AE_optimizer,
         warmup_steps=int(warmup*iterations_per_epoch),
-        start_lr=2.5e-4,
+        start_lr=1.0e-4,
         ref_lr=7.5e-4,
         final_lr=5.0e-6,
         T_max=int(ipe_scale*num_epochs*iterations_per_epoch))

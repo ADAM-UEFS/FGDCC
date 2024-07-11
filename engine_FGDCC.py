@@ -52,7 +52,8 @@ from src.helper import (
     init_model,
     init_opt,
     init_DC_opt,
-    build_cache
+    build_cache,
+    VICReg
     )
 from src.transforms import make_transforms
 import time
@@ -195,8 +196,8 @@ def main(args, resume_preempt=False):
     
     stats_logger = CSVLogger(folder + '/experiment_log.csv',
                            ('%d', 'epoch'),
-                           ('%.3f', 'backbone lr'),
-                           ('%.3f', 'autoencoder lr'),
+                           ('%.5f', 'backbone lr'),
+                           ('%.5f', 'autoencoder lr'),
                            ('%.5f', 'Total Train loss'),
                            ('%.5f', 'Parent Train loss'),
                            ('%.5f', 'Parent Test loss'),
@@ -204,6 +205,7 @@ def main(args, resume_preempt=False):
                            ('%.5f', 'Reconstruction loss'),
                            ('%.5f', 'K-Means loss'),
                            ('%.5f', 'Consistency loss'),
+                           ('%.5f', 'VICReg loss'),
                            ('%.3f', 'Test - Acc@1'),
                            ('%.3f', 'Test - Acc@5'),
                            ('%f', 'avg_empty_clusters_per_class'),
@@ -362,8 +364,10 @@ def main(args, resume_preempt=False):
         p.requires_grad = True
     target_encoder = target_encoder.module 
 
+    proj_embed_dim = 128
+    VICReg_loss = VICReg(args=None, num_features=proj_embed_dim, sim_coeff=25.0, std_coeff=25.0, cov_coeff=1.0) # Default coefficient values employed
     target_encoder = configure_finetuning(target_encoder, nb_classes=nb_classes, drop_path=drop_path, device=device)
-    hierarchical_classifier = get_classification_head(target_encoder.pretrained_model.embed_dim, nb_classes=nb_classes, drop_path=drop_path, K_range=[2,3,4,5] , device=device)
+    hierarchical_classifier = get_classification_head(target_encoder.pretrained_model.embed_dim, nb_classes=nb_classes, drop_path=drop_path, K_range=[2,3,4,5], proj_embed_dim=proj_embed_dim, device=device)
     
     # -- Override previously loaded optimization configs.
     # Create one optimizer that takes into account both encoder and its classifier parameters.
@@ -460,6 +464,7 @@ def main(args, resume_preempt=False):
         parent_cls_loss_meter = AverageMeter()
         children_cls_loss_meter = AverageMeter()
         consistency_loss_meter = AverageMeter()
+        vicreg_loss_meter = AverageMeter()
         reconstruction_loss_meter = AverageMeter()
         k_means_loss_meter = AverageMeter()
 
@@ -502,23 +507,20 @@ def main(args, resume_preempt=False):
                     # Step 2. Autoencoder Dimensionality Reduction  
                     reconstructed_input, bottleneck_output = autoencoder(h_detached)                     
 
-                    #reconstruction_loss = F.smooth_l1_loss(reconstructed_input, h_detached)
                     reconstruction_loss = l2_norm(reconstructed_input, h_detached)
 
                     # Step 3. Compute K-Means assignments with disabled autocast as faiss requires float32
                     with torch.cuda.amp.autocast(enabled=False): 
                         k_means_losses, k_means_assignments = k_means_module.assign(x=bottleneck_output, y=target, resources=resources, rank=rank, device=device, cached_features=cached_features_last_epoch)  
 
-                    #print('K-Means losses:', k_means_losses.size())
-                    #print('Targets format:', target.size())
-                    #print('Assignments format', k_means_assignments.size()) 
 
                     # Step 4. Hierarchical Classification
                     parent_logits, child_logits, parent_proj_embeddings, child_proj_embeddings = hierarchical_classifier(h, device)
 
                     loss = loss_fn(parent_logits, targets)
                     parent_cls_loss_meter.update(loss)
-                    ################################################## Under inspection #########################################################
+
+                    ################################################## To be Replaced ###########################################################
                     #############################################################################################################################
                     classifier_selection = True
                     if classifier_selection:
@@ -542,64 +544,45 @@ def main(args, resume_preempt=False):
                     #############################################################################################################################
                     #############################################################################################################################
 
-                    # -- -- -- -- -- -- -- -- -- -- -- -- 
-                    #############################################################################################################################
-                    # Model selection: Iterate through every K classifier computing the cosine similarity and select the ones with largest values 
-                    #subclass_cosine_similarities = []
-                    #for k in range(len(K_range)):
-                    #    k_means_target = k_means_assignments[:,k,:]
-                    #    k_means_target = k_means_target.squeeze(1)
-
-                        # Normalize child logits and k-means target
-                        #normalized_child_logits = F.normalize(child_logits[k], p=2, dim=1)
-                        #normalized_k_means_target = F.normalize(k_means_target, p=2, dim=1)
-                        
-                        # Compute cosine similarity
-                        #cosine_similarity = torch.sum(normalized_child_logits * normalized_k_means_target, dim=1)
-                        #subclass_cosine_similarities.append(cosine_similarity)
-
-                    #subclass_cosine_similarities = torch.vstack(subclass_cosine_similarities)
-                    #best_k_indexes = torch.argmax(subclass_cosine_similarities, dim=0)
-                    #############################################################################################################################
-                    #############################################################################################################################
-                    
                     # -- Setup losses
                     subclass_loss = 0
                     k_means_loss = 0
                     consistency_loss = 0
 
                     k_means_losses = k_means_losses.squeeze(2).transpose(0,1)
-                    #print('K-means losses:', k_means_losses.size())
 
-                    parent_probs = F.softmax(parent_proj_embeddings, dim=1)
-                    subclass_probs = [F.softmax(proj_embedding, dim=1) for proj_embedding in child_proj_embeddings]
-
+                    # -- Consistency Regularization with KL Divergence
                     size = imgs.size(0) # This allows handling cases when the number of points is different from batch size (due to drop_last=False)
+                    gathered_child_embeddings = []
                     for i in range(size):
-                        subclass_loss += subclass_losses[best_k_indexes[i]][i]
-                        k_means_loss += k_means_losses[best_k_indexes[i]][i]
-                        #consistency_loss += F.kl_div(parent_probs[i], subclass_probs[best_k_indexes[i]], reduction='batchmean') # Consistency Regularization with KL Divergence
+                        gathered_child_embeddings.append(child_proj_embeddings[best_k_indexes[i]][i])
+                    gathered_child_embeddings = torch.stack(gathered_child_embeddings)
+
+                    parent_probs = F.log_softmax(parent_proj_embeddings, dim=1)
+                    subclass_probs = F.log_softmax(gathered_child_embeddings, dim=1)
+                    consistency_loss = F.kl_div(parent_probs, subclass_probs, log_target=True,  reduction='batchmean')
+
+                    subclass_loss = subclass_losses[best_k_indexes, torch.arange(best_k_indexes.size(0))].mean()
+                    k_means_loss = k_means_losses[best_k_indexes, torch.arange(best_k_indexes.size(0))].mean()
                     
-                    # TODO: test below
-                    consistency_loss += F.kl_div(parent_probs, subclass_probs[best_k_indexes], reduction='batchmean') # Consistency Regularization with KL Divergence
+                    vicreg_loss = VICReg_loss(parent_proj_embeddings, gathered_child_embeddings)
 
-                    # -- Mean reduction
-                    subclass_loss /= size
-                    k_means_loss /= size
-                    #consistency_loss /= size
-
-                    subclass_loss = AllReduce.apply(subclass_loss).clone()
+                    #subclass_loss = AllReduce.apply(subclass_loss).clone()
                     children_cls_loss_meter.update(subclass_loss)
                     
                     consistency_loss_meter.update(consistency_loss)
-                    # Sum parent and subclass loss
-                    loss += subclass_loss + consistency_loss 
                     
-                    reconstruction_loss = AllReduce.apply(reconstruction_loss).clone()
+                    vicreg_loss_meter.update(vicreg_loss)
+
+                    # Sum parent and subclass loss + Regularizers
+                    loss += subclass_loss + consistency_loss + vicreg_loss
+                    #reconstruction_loss = AllReduce.apply(reconstruction_loss).clone()
                     reconstruction_loss_meter.update(reconstruction_loss)
-                    # Add K-means distances term as penalty to enforce a "k-means friendly space" 
+
+                    
                     # FIXME: this won't work as expected since its a constant
                     # TODO: perhaps multiplying by the gradients of the parameters from the ViT encoder.
+                    # Add K-means distances term as penalty to enforce a "k-means friendly space" 
                     reconstruction_loss += 0.25 * k_means_loss 
                     '''
                         `all_reduce`: is used to perform an element-wise reduction operation (like sum, product, max, min, etc.) 
@@ -664,9 +647,10 @@ def main(args, resume_preempt=False):
             def log_stats():
                 csv_logger.log(epoch + 1, itr, loss, etime)
                 if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
-                    logger.info('[%d, %5d/%5d] - train_losses - Parent Class: %.3f -'
-                                ' Children class: %.3f -'
-                                'Autoencoder Loss (total): %.3f - Reconstruction/K-Means Loss: [%.3f / %.3f] - Consistency Loss: [%.3f]'
+                    logger.info('[%d, %5d/%5d] - train_losses - Parent Class: %.4f -'
+                                ' Children class: %.4f -'
+                                'Autoencoder Loss (total): %.4f - Reconstruction/K-Means Loss: [%.4f / %.4f] - Consistency Loss: [%.4f]'
+                                ' - VICReg Loss: [%.4f]'
                                 '[wd: %.2e] [lr: %.2e] [autoencoder lr: %.2e]'
                                 '[mem: %.2e] '
                                 '(%.1f ms)'
@@ -676,6 +660,7 @@ def main(args, resume_preempt=False):
                                     children_cls_loss_meter.avg,
                                     (reconstruction_loss_meter.avg + k_means_loss_meter.avg), reconstruction_loss_meter.avg, k_means_loss_meter.avg,
                                     consistency_loss_meter.avg,
+                                    vicreg_loss_meter.avg,
                                     _new_wd,
                                     _new_lr,
                                     ae_lr,
@@ -799,6 +784,7 @@ def main(args, resume_preempt=False):
                         reconstruction_loss_meter.avg,
                         k_means_loss_meter.avg,
                         consistency_loss_meter.avg,
+                        vicreg_loss_meter.avg,
                         testAcc1.avg,
                         testAcc5.avg,
                         empty_clusters_per_epoch.avg,

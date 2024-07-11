@@ -114,12 +114,6 @@ INFO:root:Done.
 INFO:root:Initializing centroids...
 INFO:root:Done.
 INFO:root:M - Step...
-/home/rtcalumby/miniconda3/envs/py382/lib/python3.12/site-packages/faiss/contrib/torch_utils.py:51: UserWarning: TypedStorage is deprecated. It will be removed in the future and UntypedStorage will be the only storage class. This should only matter to you if you are using storages directly.  To access UntypedStorage directly, use tensor.untyped_storage() instead of tensor.storage()
-  x.storage().data_ptr() + x.storage_offset() * 4)
-Losses [tensor(171.9855), tensor(151.7068), tensor(135.1005), tensor(121.2441)]
-Avg no of empty clusters: 0
-Empty clusters per K:
-0 0 0 0
 INFO:root:Epoch 1
 INFO:faiss.loader:Loading faiss with AVX2 support.
 INFO:faiss.loader:Successfully loaded faiss with AVX2 support.
@@ -137,7 +131,23 @@ INFO:faiss.loader:Loading faiss with AVX2 support.
 INFO:faiss.loader:Successfully loaded faiss with AVX2 support.
 INFO:faiss.loader:Loading faiss with AVX2 support.
 INFO:faiss.loader:Successfully loaded faiss with AVX2 support.
-INFO:root:[1,     0/ 2562] - train_losses - Parent Class: 6.963 - Children class: 0.681 -Autoencoder Loss (total): 236.051 - Reconstruction/K-Means Loss: [2.000 / 234.051] - Consistency Loss: [-3.645][wd: 5.00e-02] [lr: 7.50e-05] [autoencoder lr: 2.50e-04][mem: 6.00e+04] (3152.8 ms)
-INFO:root:[1,     0] grad_stats: [2.42e-01 8.91e-01] (0.00e+00, 1.26e+03)
-INFO:root:[1,    50/ 2562] - train_losses - Parent Class: 5.883 - Children class: 0.497 -Autoencoder Loss (total): 373.961 - Reconstruction/K-Means Loss: [0.248 / 373.712] - Consistency Loss: [-3.645][wd: 5.00e-02] [lr: 7.53e-05] [autoencoder lr: 2.51e-04][mem: 6.49e+04] (1475.1 ms)
-INFO:root:[1,    50] grad_stats: [1.10e-03 6.66e-02] (5.95e-06, 2.86e+01)
+/home/rtcalumby/miniconda3/envs/py382/lib/python3.12/site-packages/faiss/contrib/torch_utils.py:51: UserWarning: TypedStorage is deprecated. It will be removed in the future and UntypedStorage will be the only storage class. This should only matter to you if you are using storages directly.  To access UntypedStorage directly, use tensor.untyped_storage() instead of tensor.storage()
+  x.storage().data_ptr() + x.storage_offset() * 4)
+Process Process-1:
+Traceback (most recent call last):
+  File "/home/rtcalumby/miniconda3/envs/py382/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/home/rtcalumby/miniconda3/envs/py382/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/rtcalumby/adam/luciano/LifeCLEFPlant2022/DeepCluster/main_FGDCC.py", line 52, in process_main
+    app_main(args=params)
+  File "/home/rtcalumby/adam/luciano/LifeCLEFPlant2022/DeepCluster/engine_FGDCC.py", line 670, in main
+    (loss, k_means_loss, ae_lr, _new_lr, _new_wd, grad_stats, bottleneck_output), etime = gpu_timer(train_step)
+                                                                                          ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/rtcalumby/adam/luciano/LifeCLEFPlant2022/DeepCluster/src/utils/logging.py", line 21, in gpu_timer
+    result = closure()
+             ^^^^^^^^^
+  File "/home/rtcalumby/adam/luciano/LifeCLEFPlant2022/DeepCluster/engine_FGDCC.py", line 584, in train_step
+    consistency_loss += F.kl_div(parent_probs, subclass_probs[best_k_indexes], reduction='batchmean') # Consistency Regularization with KL Divergence
+                                               ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+TypeError: only integer tensors of a single element can be converted to an index
